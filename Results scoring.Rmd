@@ -494,7 +494,8 @@ table(df_valid$hierarchy, df_valid$chartjunk)
 anova_model <- aov(Total_Score ~ hierarchy * chartjunk, data = df_valid)
 
 # Summary of the ANOVA
-summary(anova_model)
+print(summary(anova_model), digits = 3)
+
 
 ```
 
@@ -535,10 +536,7 @@ plot_model(lm_model, type = "int", terms = c("hierarchy", "chartjunk"))
 
 ```
 
-```{r}
-plot_model(lm_model, type = "eff", terms = c("chartjunk", "hierarchy"))
 
-```
 
 ```{r}
 plot_model(lm_model, type = "eff", terms = c("hierarchy"))
@@ -546,4 +544,3 @@ plot_model(lm_model, type = "eff", terms = c("hierarchy"))
 ```{r}
 summary.lm(anova_model)$r.squared5
 ```
-
