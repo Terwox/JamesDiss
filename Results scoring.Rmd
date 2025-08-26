@@ -542,5 +542,5 @@ plot_model(lm_model, type = "int", terms = c("hierarchy", "chartjunk"))
 plot_model(lm_model, type = "eff", terms = c("hierarchy"))
 ```
 ```{r}
-summary.lm(anova_model)$r.squared5
+summary.lm(anova_model)$r.squared
 ```
