@@ -1,0 +1,62 @@
+---
+title: "Diss Study 2"
+output: html_notebook
+---
+
+```{r}
+# install.packages(c("readr","dplyr","janitor"))
+library(readr); library(dplyr); library(pacman)
+p_load(janitor)
+
+# 1) Forward slashes (recommended on Windows too)
+path <- r"(D:\Dropbox\USD\Dissertation\Collab folder\Data\Dissertation+-+Study+2_September+30,+2025_10.01.csv)"
+
+
+# 1) Skip row 1 so row 2 becomes column names
+# 2) Read as character first so we can safely identify/remove the ImportId row
+raw <- read_csv(
+  path,
+  skip = 1,                      # drop row 1
+  col_names = TRUE,
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+)
+
+# 3) Remove the single metadata row (your old row 3) that contains "ImportId"
+dat <- raw %>%
+  filter(!if_any(everything(), ~ grepl("\\bImportId\\b", .x, ignore.case = TRUE)))
+
+# 4) Clean names and let readr infer types
+dat <- dat %>%
+  clean_names() %>%              # snake_case names
+  type_convert()                 # infer numeric/datetime where appropriate
+
+glimpse(dat)
+
+```
+
+```{r}
+library(dplyr)
+library(stringr)
+
+dat <- dat %>%
+  mutate(
+    version = as.character(version),
+
+    # pull "High/Medium/Low" from the tail
+    chartjunk = str_match(version, "(High|Medium|Low)Chartjunk$")[,2],
+    chartjunk = factor(chartjunk, levels = c("Low","Medium","High"), ordered = TRUE),
+
+    # remove that tail to get the hierarchy label
+    hier_raw  = str_remove(version, "(High|Medium|Low)Chartjunk$"),
+    hierarchy = recode(hier_raw,
+                       "NoHierarchy"          = "none",
+                       "FloorplanHierarchy"   = "floorplan",
+                       "RoomHierarchy"        = "room",
+                       "ImportanceHierarchy"  = "importance"),
+    hierarchy = factor(hierarchy)  # unordered
+  ) %>%
+  select(-hier_raw)
+
+```
+

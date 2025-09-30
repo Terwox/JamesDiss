@@ -1,0 +1,197 @@
+
+# ---- Appendix: Study 2 Analyses (ANOVA / ANCOVA, sjPlot outputs) ----
+
+```{r setup-appendix, message=FALSE, warning=FALSE}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(dplyr, tidyr, stringr, janitor, ggplot2,
+               car, effectsize, sjPlot, emmeans, broom, purrr, tibble)
+theme_set(sjPlot::theme_sjplot())
+options(contrasts = c("contr.treatment", "contr.poly"))
+```
+
+## Data prep (robust to missing flags / columns)
+
+```{r data-prep-appendix}
+# prefer attention-filtered data if present
+dat0 <- if (exists("dat_attn")) dat_attn else if (exists("dat")) dat else stop("No data object named dat_attn or dat found.")
+
+# Coerce score to numeric if needed (Qualtrics scores often come in as character)
+score_col <- c("Score","score","SC0","Q_Score","TotalScore")
+score_col <- score_col[score_col %in% names(dat0)][1] %||% "Score"
+if (!score_col %in% names(dat0)) stop("Could not find a score column. Expected one of: ", paste(score_col, collapse=", "))
+
+dat0 <- dat0 %>% mutate(score = suppressWarnings(as.numeric(.data[[score_col]])))
+
+# If hierarchy / chartjunk not present, derive from version
+if (!all(c("hierarchy","chartjunk") %in% names(dat0))) {
+  version_col <- c("version","Version","condition","Condition")
+  version_col <- version_col[version_col %in% names(dat0)][1] %||% "version"
+  if (!version_col %in% names(dat0)) stop("Need either (hierarchy, chartjunk) or a version column to derive from.")
+
+  dat0 <- dat0 %>% mutate(
+    hierarchy = case_when(
+      str_detect(.data[[version_col]], regex("NoHierarchy", ignore_case = TRUE)) ~ "NoHierarchy",
+      str_detect(.data[[version_col]], regex("RoomHierarchy", ignore_case = TRUE)) ~ "RoomHierarchy",
+      str_detect(.data[[version_col]], regex("ImportanceHierarchy", ignore_case = TRUE)) ~ "ImportanceHierarchy",
+      str_detect(.data[[version_col]], regex("FloorplanHierarchy", ignore_case = TRUE)) ~ "FloorplanHierarchy",
+      TRUE ~ NA_character_
+    ),
+    chartjunk = case_when(
+      str_detect(.data[[version_col]], regex("HighChartjunk|ChartjunkHigh|High", ignore_case = TRUE)) ~ "High",
+      str_detect(.data[[version_col]], regex("MediumChartjunk|ChartjunkMedium|Medium", ignore_case = TRUE)) ~ "Medium",
+      str_detect(.data[[version_col]], regex("LowChartjunk|ChartjunkLow|Low", ignore_case = TRUE)) ~ "Low",
+      TRUE ~ NA_character_
+    )
+  )
+}
+
+# Order/format factors
+# hierarchy is nominal (not ordinal)
+dat0 <- dat0 %>% mutate(
+  hierarchy = factor(hierarchy),
+  # chartjunk is ordinal
+  chartjunk = factor(chartjunk,
+                     levels = c("Low","Medium","High"),
+                     ordered = TRUE)
+)
+
+# Longstring exclusion if available
+if ("longstring_flag" %in% names(dat0)) {
+  dat0 <- dat0 %>% filter(!coalesce(longstring_flag, FALSE))
+}
+
+# SurveyWave optional (used only for covariate/control if present)
+if ("surveywave" %in% names(dat0)) {
+  dat0 <- dat0 %>% mutate(surveywave = factor(surveywave))
+}
+
+# Resolution covariates (robust detection)
+nm <- names(dat0)
+
+cand_h <- nm[str_detect(nm, regex("(screen|browser|res(olution)?|client).*height", ignore_case = TRUE))]
+cand_w <- nm[str_detect(nm, regex("(screen|browser|res(olution)?|client).*width",  ignore_case = TRUE))]
+
+res_h_col <- cand_h[1] %||% NA_character_
+res_w_col <- cand_w[1] %||% NA_character_
+
+# Explicit area column, if any
+cand_area <- nm[str_detect(nm, regex("res(olution)?_?area|screen_?area|area_px", ignore_case = TRUE))]
+res_area_col <- cand_area[1] %||% NA_character_
+
+dat0 <- dat0 %>% mutate(
+  res_height = suppressWarnings(as.numeric(.data[[res_h_col]])),
+  res_width  = suppressWarnings(as.numeric(.data[[res_w_col]]))
+)
+
+# Compute area if we can, else use provided
+if (!is.na(res_area_col)) {
+  dat0 <- dat0 %>% mutate(res_area = suppressWarnings(as.numeric(.data[[res_area_col]])))
+} else if (all(c("res_width","res_height") %in% names(dat0))) {
+  dat0 <- dat0 %>% mutate(res_area = res_width * res_height)
+}
+
+# Keep analysis-ready subset
+datA <- dat0 %>%
+  filter(!is.na(score), !is.na(hierarchy), !is.na(chartjunk)) %>%
+  rename(chartjunk_ord = chartjunk) %>%
+  droplevels()
+
+summary(datA$hierarchy); summary(datA$chartjunk_ord)
+```
+
+## ANOVA: hierarchy × chartjunk (no covariates)
+
+```{r anova-main, fig.width=7, fig.height=4}
+m_anova <- lm(score ~ hierarchy * chartjunk_ord, data = datA)
+anova(m_anova)
+
+# sjPlot table of coefficients
+sjPlot::tab_model(m_anova, show.std = TRUE, show.aic = TRUE, dv.labels = "Score")
+
+# Interaction plot
+sjPlot::plot_model(m_anova, type = "int", terms = c("hierarchy", "chartjunk_ord"))
+```
+
+### Main-effect plots (predicted means)
+
+```{r main-effects, fig.width=6.5, fig.height=4}
+# hierarchy main effect (marginalized over chartjunk)
+sjPlot::plot_model(m_anova, type = "pred", terms = "hierarchy")
+
+# chartjunk (ordinal) main effect
+sjPlot::plot_model(m_anova, type = "pred", terms = "chartjunk_ord")
+```
+
+### Effect sizes (η² / partial η²)
+
+```{r anova-effectsizes}
+anova_tbl <- anova(m_anova)
+effectsize::eta_squared(anova_tbl, partial = FALSE)
+effectsize::eta_squared(m_anova, partial = TRUE)  # partial η²
+```
+
+## ANCOVA: adjusting for resolution (height vs. area)
+
+```{r ancova-resolution, fig.width=7, fig.height=4}
+# Choose available resolution covariates
+has_h <- "res_height" %in% names(datA) && any(is.finite(datA$res_height))
+has_a <- "res_area"   %in% names(datA) && any(is.finite(datA$res_area))
+
+models <- list()
+
+if (has_h) {
+  m_ancova_h <- lm(score ~ hierarchy * chartjunk_ord + res_height + surveywave, data = datA)
+  models$Height <- m_ancova_h
+}
+if (has_a) {
+  m_ancova_a <- lm(score ~ hierarchy * chartjunk_ord + res_area + surveywave, data = datA)
+  models$Area <- m_ancova_a
+}
+
+if (length(models) == 0) stop("No usable resolution covariate found (height or area).")
+
+# sjPlot tables
+do.call(sjPlot::tab_model, c(models, list(show.std = TRUE, show.aic = TRUE, dv.labels = "Score")))
+
+# Compare which resolution covariate is more informative
+cmp <- tibble::tibble(
+  Model = names(models),
+  AIC   = purrr::map_dbl(models, AIC),
+  BIC   = purrr::map_dbl(models, BIC),
+  R2    = purrr::map_dbl(models, ~ broom::glance(.x)$r.squared %||% NA_real_),
+  AdjR2 = purrr::map_dbl(models, ~ broom::glance(.x)$adj.r.squared %||% NA_real_)
+) %>% arrange(AIC)
+cmp
+```
+
+### ANCOVA interaction & main-effect plots
+
+```{r ancova-plots, fig.width=7, fig.height=4, results='hide'}
+m_ref <- models[[1]]
+
+# Interaction (hierarchy × chartjunk)
+sjPlot::plot_model(m_ref, type = "int", terms = c("hierarchy", "chartjunk_ord"))
+
+# Main effects
+sjPlot::plot_model(m_ref, type = "pred", terms = "hierarchy")
+sjPlot::plot_model(m_ref, type = "pred", terms = "chartjunk_ord")
+```
+
+### Trend test for chartjunk (ordinal)
+
+```{r chartjunk-trend}
+# Polynomial (linear, quadratic) trends via emmeans
+emms <- emmeans::emmeans(m_anova, ~ chartjunk_ord)
+emmeans::contrast(emms, method = "poly")
+```
+
+### Optional: report-friendly tables
+
+```{r report-tables, results='asis'}
+# Type-III ANOVA (if you prefer)
+car::Anova(m_anova, type = 3)
+
+# Partial η² for ANCOVA (first model shown)
+m_ref <- models[[1]]
+effectsize::eta_squared(car::Anova(m_ref, type = 3), partial = TRUE)
+```

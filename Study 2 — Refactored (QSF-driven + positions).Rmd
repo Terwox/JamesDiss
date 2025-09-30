@@ -1,0 +1,399 @@
+---
+title: "Study 2 — Refactored (QSF-driven items, position-aware longstring)"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(readr, dplyr, stringr, janitor, ggplot2, jsonlite, car, effectsize, sjPlot, vcd, rstatix)
+```
+
+## Paths (set these)
+
+```{r paths}
+# EDIT THESE for your machine
+csv_path <- r"(D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation+-+Study+2_September+30,+2025_10.01.csv)"
+qsf_path <- r"(D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation_-_Study_2.qsf)"
+```
+
+## Load & clean CSV (row 2 headers; drop ImportId row)
+
+```{r load_csv}
+raw <- readr::read_csv(csv_path, skip = 1, col_types = readr::cols(.default = readr::col_character()), show_col_types = FALSE)
+
+dat <- raw %>%
+  dplyr::filter(!dplyr::if_any(dplyr::everything(), ~ grepl("\\bImportId\\b", .x, ignore.case = TRUE)))
+
+# Keep an unmodified copy with original column names
+dat_orig <- dat
+```
+
+## Parse QSF → exact Q1–Q20 metadata
+
+```{r parse_qsf}
+stopifnot(file.exists(qsf_path))
+qsf <- jsonlite::fromJSON(qsf_path, simplifyVector = FALSE)
+
+# Pull question elements (SQ) with DataExportTag Q1..Q20
+sq <- Filter(function(el) identical(el$Element, "SQ"), qsf$SurveyElements)
+
+get_tag <- function(payload) payload$DataExportTag %||% NA_character_
+get_qid <- function(payload) payload$QuestionID %||% NA_character_
+get_text <- function(payload) payload$QuestionText %||% NA_character_
+
+# Map choices: recode -> display text
+get_choices <- function(payload){
+  ch <- payload$Choices %||% list()
+  # returns a data.frame with recode (character) and text
+  recodes <- names(ch)
+  if (is.null(recodes)) return(tibble::tibble(recode=character(0), text=character(0)))
+  tibble::tibble(
+    recode = recodes,
+    text   = vapply(ch, function(x) x$Display %||% "", character(1))
+  )
+}
+
+# Default choice order from QSF (if no display-order column in CSV)
+get_choice_order <- function(payload){
+  ord <- payload$ChoiceOrder %||% names(payload$Choices)
+  unname(as.character(ord))
+}
+
+# Randomization flags
+get_randomize <- function(payload){
+  ra <- payload$Randomization %||% list()
+  # Heuristic: randomize if 'Advanced'/'RandomizeAnswers'/'Type' present; else FALSE
+  if (!is.null(ra$Advanced) && isTRUE(ra$Advanced)) return(TRUE)
+  if (!is.null(ra$RandomizeAnswers) && isTRUE(ra$RandomizeAnswers)) return(TRUE)
+  if (!is.null(ra$Type)) return(TRUE)
+  FALSE
+}
+
+# Build metadata frame
+q_meta <- lapply(sq, function(el){
+  p <- el$Payload
+  tibble::tibble(
+    tag   = get_tag(p),
+    qid   = get_qid(p),
+    text  = get_text(p),
+    randomize = get_randomize(p),
+    choice_order_default = list(get_choice_order(p)),
+    choices = list(get_choices(p))
+  )
+}) %>% dplyr::bind_rows() %>%
+  dplyr::filter(!is.na(tag), grepl("^Q([1-9]|1[0-9]|20)$", tag)) %>%
+  dplyr::arrange(factor(tag, levels = paste0("Q", 1:20)))
+
+q_meta
+```
+
+## Align Q1–Q20 to CSV columns and compute chosen **position** per item
+
+```{r positions, message=FALSE, warning=FALSE}
+# Helper: find the CSV column for a given question by matching QSF text exactly first,
+# else fuzzy starts-with match
+find_csv_col <- function(q_text, cols){
+  # exact
+  m <- which(cols == q_text)[1]
+  if (!is.na(m)) return(cols[m])
+  # starts-with
+  m <- which(startsWith(cols, q_text))[1]
+  if (!is.na(m)) return(cols[m])
+  # fallback NA
+  NA_character_
+}
+
+cols <- names(dat)
+
+q_meta <- q_meta %>%
+  dplyr::mutate(
+    csv_col       = vapply(text, find_csv_col, character(1), cols = cols),
+    csv_col_order = ifelse(is.na(csv_col), NA_character_, paste0(csv_col, " - Display Order"))
+  )
+
+# Warn if any missing
+missing_map <- q_meta %>% dplyr::filter(is.na(csv_col))
+if (nrow(missing_map)) {
+  warning("Some Q1–Q20 couldn't be matched to CSV columns:\n",
+          paste(missing_map$tag, "→", substr(missing_map$text,1,50), collapse = "\n"))
+}
+
+# Function to compute 1-based position index using display order if available
+compute_position <- function(answer_val, display_order, choices_df, default_order){
+  # 'display_order' may look like "1,3,2,4" (recode values)
+  # If 'answer_val' is text, map to recode via 'choices_df'
+  # If 'answer_val' is numeric/recode as character, leave as recode
+  recode_val <- NA_character_
+  if (!is.na(answer_val)) {
+    if (answer_val %in% choices_df$text) {
+      # text -> recode
+      recode_val <- choices_df$recode[match(answer_val, choices_df$text)]
+    } else if (answer_val %in% choices_df$recode) {
+      recode_val <- as.character(answer_val)
+    } else {
+      # try to coerce numerics-as-text
+      suppressWarnings({
+        if (!is.na(as.numeric(answer_val))) recode_val <- as.character(as.numeric(answer_val))
+      })
+    }
+  }
+  # determine order vector
+  ord <- NA_character_
+  if (!is.na(display_order) && nzchar(display_order)) {
+    ord <- trimws(unlist(strsplit(display_order, "[,|;]")))
+  } else {
+    ord <- default_order
+  }
+  # find position
+  if (!is.na(recode_val) && length(ord) > 0) {
+    pos <- match(recode_val, ord)
+    if (is.na(pos)) {
+      # Sometimes export uses "1 - Choice text"; try extracting leading digits
+      if (!is.na(answer_val)) {
+        m <- regmatches(answer_val, regexpr("^\\s*\\d+", answer_val))
+        if (length(m) && nzchar(m)) pos <- match(m, ord)
+      }
+    }
+    return(ifelse(is.na(pos), NA_integer_, as.integer(pos)))
+  }
+  NA_integer_
+}
+
+# Iterate over Q1–Q20 and add position columns
+for (i in seq_len(nrow(q_meta))) {
+  meta <- q_meta[i, ]
+  qcol <- meta$csv_col
+  odcol <- meta$csv_col_order
+  if (is.na(qcol)) next
+  ch <- meta$choices[[1]]
+  def_ord <- meta$choice_order_default[[1]]
+  pos_name <- paste0(meta$tag, "_position")
+  dat[[pos_name]] <- mapply(
+    compute_position,
+    answer_val   = dat[[qcol]],
+    display_order= if (!is.na(odcol) && odcol %in% names(dat)) dat[[odcol]] else NA_character_,
+    MoreArgs = list(choices_df = ch, default_order = def_ord),
+    USE.NAMES = FALSE
+  )
+}
+
+# vectors of item columns and position columns
+item_cols_Q1_Q20 <- q_meta$csv_col
+pos_cols_Q1_Q20  <- paste0(q_meta$tag, "_position")
+
+# Quick peek
+data.frame(tag = q_meta$tag, text = q_meta$text, csv_col = q_meta$csv_col, position_col = pos_cols_Q1_Q20)
+```
+
+## Attention filter (Smart Home)
+
+```{r attention_filter, message=FALSE, warning=FALSE}
+attn_col <- grep("^What type of dashboard did you see\\??$", names(dat), ignore.case = TRUE, value = TRUE)
+
+if (length(attn_col) == 0) {
+  message("Attention check column not found — no rows removed at this step.")
+  dat_attn <- dat
+  dat_attn$exclude_reason <- NA_character_
+} else {
+  keep_idx <- grepl("smart\\s*home", dat[[attn_col]], ignore.case = TRUE)
+  dat$exclude_reason <- ifelse(keep_idx, NA_character_, "attention_fail")
+  dat_attn <- dat[keep_idx %in% TRUE, , drop = FALSE]
+}
+```
+
+## Longstring (position-aware, Q1–Q20)
+
+```{r longstring_positions}
+# Pull the computed position columns we just created
+present_pos <- pos_cols_Q1_Q20[pos_cols_Q1_Q20 %in% names(dat_attn)]
+
+if (length(present_pos) == 0) {
+  warning("No position columns were found. Longstring based on positions cannot run.")
+  dat_final <- dat_attn
+} else {
+  vals <- dat_attn[, present_pos, drop = FALSE]
+  ls_run <- apply(vals, 1, function(row) {
+    v <- as.integer(row)
+    # rle of positions; treat NAs as breaks
+    r <- rle(ifelse(is.na(v), paste0("NA_", seq_along(v)), paste0("V", v)))
+    max(r$lengths, na.rm = TRUE)
+  })
+  q3  <- stats::quantile(ls_run, 0.75, na.rm = TRUE)
+  iqr <- stats::IQR(ls_run, na.rm = TRUE)
+  thr <- q3 + 1.5 * iqr
+  flag_ls <- ls_run > thr
+
+  dat_attn$longstring_run <- ls_run
+  dat_attn$exclude_reason <- ifelse(is.na(dat_attn$exclude_reason) & flag_ls, "longstring_outlier",
+                             ifelse(!is.na(dat_attn$exclude_reason) & flag_ls, paste(dat_attn$exclude_reason, "+ longstring_outlier"), dat_attn$exclude_reason))
+  dat_final <- dat_attn[!flag_ls, , drop = FALSE]
+
+  cat("Position-based longstring: threshold >", round(thr,2), " | removed", sum(flag_ls, na.rm = TRUE), "rows.\n")
+}
+```
+
+## Resolution → res_height & res_area
+
+```{r resolution_parse, message=FALSE, warning=FALSE}
+res_col <- grep("^resolution$", names(dat_final), ignore.case = TRUE, value = TRUE)
+if (length(res_col) == 1) {
+  res_str <- dat_final[[res_col]]
+  wh <- do.call(rbind, strsplit(as.character(res_str), "[^0-9]+"))
+  suppressWarnings({
+    res_width  <- as.numeric(wh[,1])
+    res_height <- as.numeric(wh[,2])
+  })
+  dat_final$res_width  <- res_width
+  dat_final$res_height <- res_height
+  dat_final$res_area   <- res_width * res_height
+} else {
+  message("No 'resolution' field detected; res_width/height/area not added.")
+}
+```
+
+## Factors & outcome
+
+```{r factors_outcome}
+# version → chartjunk (ordered) & hierarchy (nominal)
+dat_final <- dat_final %>% dplyr::mutate(version = as.character(.data[["Version"]] %||% .data[["version"]]))
+
+cj <- stringr::str_match(dat_final$version, "(High|Medium|Low)Chartjunk$")[,2]
+dat_final$chartjunk <- factor(cj, levels = c("Low","Medium","High"), ordered = TRUE)
+
+hier_raw <- stringr::str_remove(dat_final$version, "(High|Medium|Low)Chartjunk$")
+dat_final$hierarchy <- dplyr::recode(hier_raw,
+  "NoHierarchy" = "none",
+  "FloorplanHierarchy" = "floorplan",
+  "RoomHierarchy" = "room",
+  "ImportanceHierarchy" = "importance",
+  .default = NA_character_
+) |> factor()
+
+# Outcome: prefer existing Score
+score_col <- grep("^Score$", names(dat_final), value = TRUE)
+if (length(score_col) == 1) {
+  dat_final$Total_Score <- suppressWarnings(as.numeric(dat_final[[score_col]]))
+} else {
+  sc_cols <- grep("^SC\\d+$", names(dat_final), value = TRUE)
+  if (length(sc_cols)) {
+    dat_final[sc_cols] <- lapply(dat_final[sc_cols], function(x) suppressWarnings(as.numeric(x)))
+    dat_final$Total_Score <- rowSums(dat_final[sc_cols], na.rm = TRUE)
+  } else {
+    dat_final$Total_Score <- NA_real_
+  }
+}
+```
+
+## Model with covariates (res_height, res_area if present)
+
+```{r model, message=FALSE, warning=FALSE}
+covar_vec <- intersect(c("res_height","res_area"), names(dat_final))
+if (is.ordered(dat_final$chartjunk)) {
+  contrasts(dat_final$chartjunk) <- contr.poly(length(levels(dat_final$chartjunk)))
+}
+rhs <- c("hierarchy * chartjunk", if (length(covar_vec)) covar_vec else NULL)
+form <- as.formula(paste("Total_Score ~", paste(rhs, collapse = " + ")))
+cat("Model formula:", deparse(form), "\n")
+
+lm_model <- lm(form, data = dat_final)
+car::Anova(lm_model, type = 2)
+```
+
+## Effect sizes
+
+```{r effects}
+list(
+  eta_sq        = effectsize::eta_squared(lm_model, partial = FALSE, ci = 0.90),
+  partial_eta_sq= effectsize::eta_squared(lm_model, partial = TRUE,  ci = 0.90),
+  omega_sq      = effectsize::omega_squared(lm_model, partial = FALSE, ci = 0.90)
+)
+```
+
+## Item ↔ hierarchy diagnostics (including **position**)
+
+```{r item_diag, message=FALSE, warning=FALSE, fig.height=5, fig.width=8}
+# Per-item association using response value (categorical/ordinal) as before
+# and also position (1..n)
+
+# 1) Response-based effects (ordinal vs nominal)
+item_cols <- item_cols_Q1_Q20
+item_cols <- item_cols[!is.na(item_cols)]
+resp_results <- list()
+
+for (nm in item_cols) {
+  x <- dat_final[[nm]]
+  g <- dat_final$hierarchy
+  x_num <- suppressWarnings(as.numeric(x))
+  uniq <- length(unique(na.omit(x)))
+  if (!all(is.na(x_num)) && uniq <= 7) {
+    kt <- kruskal.test(x_num ~ g)
+    H <- unname(kt$statistic); k <- nlevels(g); n <- sum(!is.na(x_num) & !is.na(g))
+    eps2 <- (H - k + 1) / (n - k)
+    resp_results[[nm]] <- data.frame(item = nm, method = "Kruskal-epsilon^2", effect = eps2, p = kt$p.value)
+  } else {
+    tbl <- table(as.factor(x), g, useNA = "no")
+    chi <- suppressWarnings(chisq.test(tbl))
+    n <- sum(tbl); r <- nrow(tbl); c <- ncol(tbl)
+    V <- sqrt(unname(chi$statistic) / (n * (min(r - 1, c - 1))))
+    resp_results[[nm]] <- data.frame(item = nm, method = "CramersV", effect = V, p = chi$p.value)
+  }
+}
+
+resp_fx <- dplyr::bind_rows(resp_results)
+
+# 2) Position-based effects (numeric position vs hierarchy via Kruskal)
+pos_cols <- pos_cols_Q1_Q20[pos_cols_Q1_Q20 %in% names(dat_final)]
+pos_results <- list()
+for (i in seq_along(pos_cols)) {
+  nm <- pos_cols[i]; g <- dat_final$hierarchy
+  pos <- dat_final[[nm]]
+  if (is.null(pos)) next
+  if (all(is.na(pos))) next
+  kt <- kruskal.test(pos ~ g)
+  H <- unname(kt$statistic); k <- nlevels(g); n <- sum(!is.na(pos) & !is.na(g))
+  eps2 <- (H - k + 1) / (n - k)
+  pos_results[[nm]] <- data.frame(item = nm, method = "Position (Kruskal ε²)", effect = eps2, p = kt$p.value)
+}
+pos_fx <- dplyr::bind_rows(pos_results)
+
+# Combine & plot top effects
+all_fx <- dplyr::bind_rows(resp_fx, pos_fx) %>% dplyr::arrange(dplyr::desc(effect))
+head(all_fx, 10)
+
+topN <- head(all_fx$item, 15)
+plot_df <- all_fx %>% dplyr::filter(item %in% topN)
+
+ggplot(plot_df, aes(x = reorder(item, effect), y = effect, fill = method)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Item–Hierarchy effects (response & position)",
+       x = "Item / Position metric", y = "Effect size") +
+  theme_minimal()
+```
+
+## QA — exclusions & balance
+
+```{r qa}
+total_n <- nrow(dat)
+kept_n  <- nrow(dat_final)
+cat("Total rows:", total_n, " | Kept after filters:", kept_n, " | Removed:", total_n - kept_n, "\n")
+
+if ("exclude_reason" %in% names(dat_attn)) {
+  table(dat_attn$exclude_reason, useNA = "ifany")
+}
+
+if (all(c("hierarchy","chartjunk") %in% names(dat_final))) {
+  with(dat_final, table(hierarchy, chartjunk))
+}
+
+# Position distributions (quick check)
+if (length(pos_cols_Q1_Q20[pos_cols_Q1_Q20 %in% names(dat_final)]) > 0) {
+  pos_long <- tidyr::pivot_longer(dat_final, all_of(pos_cols_Q1_Q20[pos_cols_Q1_Q20 %in% names(dat_final)]),
+                                  names_to = "item", values_to = "position")
+  ggplot(pos_long, aes(x = factor(position))) + geom_bar() +
+    facet_wrap(~ item, scales = "free_y") + theme_minimal() +
+    labs(title = "Chosen positions per item", x = "Position index", y = "Count")
+}
+```

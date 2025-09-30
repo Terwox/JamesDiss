@@ -99,7 +99,7 @@ ggplot(df, aes(x = group, y = Total_Score)) +
 ```{r}
 p_load(readr)
 # Load the data
-df <- read_csv("D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation+-+Pilot_June+21,+2025_13.00.csv" )
+df <- read_csv("D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation+-+Pilot_August+26,+2025_15.07.csv")
 ```
 
 ## Score data
@@ -498,6 +498,37 @@ print(summary(anova_model), digits = 3)
 
 
 ```
+
+```{r}
+# Summary of the ANOVA
+print(summary.lm(anova_model), digits = 3)
+```
+
+
+```{r}
+# assuming anova_model is your 2x2 ANOVA (aov/lm or afex object)
+library(effectsize)
+
+library(effectsize)
+
+round_df <- function(x, k = 3) {
+  x <- as.data.frame(x)
+  num <- vapply(x, is.numeric, logical(1))
+  x[num] <- lapply(x[num], round, k)
+  x
+}
+
+es_omega  <- omega_squared(anova_model)
+es_eta_p  <- eta_squared(anova_model, partial = TRUE)
+es_eta_g  <- eta_squared(anova_model, generalized = TRUE)
+
+round_df(es_omega)
+round_df(es_eta_p)
+round_df(es_eta_g)
+
+
+```
+
 
 ```{r}
 means <- aggregate(Total_Score ~ hierarchy + chartjunk, data = df_valid, mean)

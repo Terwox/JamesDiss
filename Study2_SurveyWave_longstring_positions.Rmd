@@ -1,0 +1,310 @@
+---
+title: "Study 2 — Positions (QSF keys), Attention Filter, SurveyWave-Aware Longstring, and Resolution Covariates"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(readr, dplyr, stringr, janitor, ggplot2, jsonlite, car, effectsize, sjPlot, vcd, rstatix, tidyr, purrr, tibble)
+
+# a handy %||% for defaults
+`%||%` <- function(a,b) if (is.null(a) || length(a)==0) b else a
+
+# ---- User paths (edit if needed) ----
+# Windows raw-string literal style is supported in R >= 4.0 as r"(...)"
+csv_path <- r"(D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation+-+Study+2_September+30,+2025_10.01.csv)"
+qsf_path <- r"(D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation_-_Study_2.qsf)"
+
+stopifnot(file.exists(csv_path), file.exists(qsf_path))
+
+# ---- Load CSV (skip first meta row, drop the Qualtrics "ImportId" row if present) ----
+raw <- readr::read_csv(csv_path, skip = 1, col_types = readr::cols(.default = readr::col_character()), show_col_types = FALSE)
+
+dat <- raw %>%
+  dplyr::filter(!dplyr::if_any(dplyr::everything(), ~ grepl("ImportId", .x, fixed = TRUE)))
+
+dat_orig <- dat  # keep a copy
+```
+
+# Map QSF → CSV, compute per-question positions
+We derive answer **keys** from the QSF and compute respondent-specific **positions** based on each row's _Display Order_ (or the default order if the DO column is absent).
+
+```{r qsf-positions, message=FALSE, warning=FALSE}
+# ---- Read QSF & extract Question metadata for Q1..Q20 ----
+qsf <- jsonlite::fromJSON(qsf_path, simplifyVector = FALSE)
+sq  <- Filter(function(el) identical(el$Element, "SQ"), qsf$SurveyElements)
+
+get_tag   <- function(p) p$DataExportTag %||% NA_character_
+get_qid   <- function(p) p$QuestionID    %||% NA_character_
+get_text  <- function(p) p$QuestionText  %||% NA_character_
+get_rand  <- function(p) { ra <- p$Randomization %||% list(); if (isTRUE(ra$Advanced) || isTRUE(ra$RandomizeAnswers) || !is.null(ra$Type)) TRUE else FALSE }
+get_choice_order <- function(p) { ord <- p$ChoiceOrder %||% names(p$Choices); unname(as.character(ord)) }
+get_choices_tbl <- function(p) {
+  ch <- p$Choices %||% list()
+  keys <- names(ch) %||% character(0)
+  if (!length(keys)) return(tibble::tibble(key=character(0), text=character(0), recode=character(0)))
+  rv <- p$RecodeValues %||% list()
+  recode_vec <- vapply(keys, function(k) as.character(rv[[k]] %||% NA_character_), character(1))
+  tibble::tibble(
+    key    = as.character(keys),
+    text   = vapply(ch, function(x) x$Display %||% "", character(1)),
+    recode = recode_vec
+  )
+}
+
+q_meta <- lapply(sq, function(el) {
+  p <- el$Payload
+  tibble::tibble(tag=get_tag(p), qid=get_qid(p), text=get_text(p), randomize=get_rand(p),
+                 choice_order_default=list(get_choice_order(p)),
+                 choices=list(get_choices_tbl(p)))
+}) %>%
+  dplyr::bind_rows() %>%
+  dplyr::filter(!is.na(tag), grepl("^Q([1-9]|1[0-9]|20)$", tag)) %>%
+  dplyr::arrange(factor(tag, levels = paste0("Q", 1:20)))
+
+# ---- Match QSF question text to CSV columns ----
+find_csv_col <- function(q_text, cols){
+  # 1) exact match
+  m <- which(cols == q_text)[1]; if (!is.na(m)) return(cols[m])
+  # 2) starts with question text
+  m <- which(startsWith(cols, q_text))[1]; if (!is.na(m)) return(cols[m])
+  # 3) fallback NA
+  NA_character_
+}
+cols <- names(dat)
+
+q_meta <- q_meta %>% dplyr::mutate(
+  csv_col       = vapply(text, find_csv_col, character(1), cols = cols),
+  csv_col_order = ifelse(is.na(csv_col), NA_character_, paste0(csv_col, " - Display Order"))
+)
+
+# ---- Safe regex helpers (POSIX classes; no need for perl=TRUE) ----
+answer_to_key <- function(answer_val, choices){
+  if (is.na(answer_val) || !length(choices$key)) return(NA_character_)
+  ans <- as.character(answer_val)
+  # 1) exact text match
+  idx <- match(ans, choices$text);    if (!is.na(idx)) return(choices$key[idx])
+  # 2) recode match (when export stores numeric recode)
+  idx <- match(ans, choices$recode);  if (!is.na(idx)) return(choices$key[idx])
+  # 3) forms like "1 - Choice text": extract leading digits
+  lead <- regmatches(ans, regexpr("^[[:space:]]*[0-9]+", ans))
+  if (length(lead) && nchar(lead)) {
+    lead <- sub("^[[:space:]]*([0-9]+).*", "\\1", lead)
+    idx <- match(lead, choices$key)
+    if (!is.na(idx)) return(choices$key[idx])
+  }
+  # 4) if the stored value is already a key
+  if (ans %in% choices$key) return(ans)
+  NA_character_
+}
+
+order_to_keys <- function(order_str, choices, default_keys){
+  if (is.na(order_str) || !nzchar(order_str)) return(default_keys)
+  # detect delimiter
+  delim <- if (grepl("\\|", order_str)) "\\|" else if (grepl(";", order_str)) ";" else ","
+  toks <- trimws(unlist(strsplit(order_str, delim)))
+  if (!length(toks)) return(default_keys)
+  # A) tokens are already keys
+  if (all(toks %in% choices$key)) return(toks)
+  # B) tokens are full texts
+  if (all(toks %in% choices$text)) return(choices$key[match(toks, choices$text)])
+  # C) tokens like "1 - Choice text": extract leading digits
+  lead <- sub("^[[:space:]]*([0-9]+).*", "\\1", toks)
+  if (all(lead %in% choices$key)) return(lead)
+  # fallback
+  default_keys
+}
+
+# ---- Build per-QID position columns, then coalesce to tag-level Q*_position ----
+pos_map <- list()
+
+for (i in seq_len(nrow(q_meta))) {
+  meta <- q_meta[i, ]
+  qcol <- meta$csv_col
+  if (is.na(qcol)) next
+  odcol    <- meta$csv_col_order
+  choices  <- meta$choices[[1]]
+  def_keys <- meta$choice_order_default[[1]]
+  qid      <- meta$qid
+  tag      <- meta$tag
+  pos_name <- paste0(tag, "_", qid, "_position")
+
+  # map the stored answer (text/recode/key) to the QSF choice key
+  ans_keys <- vapply(dat[[qcol]], answer_to_key, character(1), choices = choices)
+
+  # parse each row's Display Order into a vector of keys (list-column)
+  ord_keys <- if (!is.na(odcol) && odcol %in% names(dat)) {
+    lapply(dat[[odcol]], order_to_keys, choices = choices, default_keys = def_keys)
+  } else {
+    rep(list(def_keys), nrow(dat))
+  }
+
+  # position = index of chosen key in that row's order vector
+  pos <- mapply(function(k, ord) {
+    if (is.na(k) || !length(ord)) return(NA_integer_)
+    p <- match(k, ord)
+    if (is.na(p)) NA_integer_ else as.integer(p)
+  }, ans_keys, ord_keys, SIMPLIFY = TRUE, USE.NAMES = FALSE)
+
+  dat[[pos_name]] <- as.integer(pos)
+  pos_map[[pos_name]] <- pos_name
+}
+
+# ---- Coalesce per-tag across QIDs -> single Q*_position ----
+tags <- unique(q_meta$tag)
+for (tg in tags) {
+  cols_tg <- grep(paste0("^", tg, "_.*_position$"), names(dat), value = TRUE)
+  if (length(cols_tg)) {
+    dat[[paste0(tg, "_position")]] <- purrr::reduce(dat[cols_tg], dplyr::coalesce)
+    # (optional) make sure it's integer
+    dat[[paste0(tg, "_position")]] <- as.integer(dat[[paste0(tg, "_position")]])
+  }
+}
+
+
+# Keep vector of the coalesced Q*_position columns that exist
+pos_cols_Q1_Q20 <- paste0("Q", 1:20, "_position")
+pos_cols_Q1_Q20 <- pos_cols_Q1_Q20[pos_cols_Q1_Q20 %in% names(dat)]
+length(pos_cols_Q1_Q20)
+```
+
+# Attention check — keep only “Smart Home”
+We drop respondents who don’t report **Smart Home** (case-insensitive, allows optional whitespace).
+
+```{r attention, message=FALSE, warning=FALSE}
+# Find the attention question column
+attn_col <- grep("^What type of dashboard did you see\\??$", names(dat),
+                 ignore.case = TRUE, value = TRUE)
+if (length(attn_col) > 1) attn_col <- attn_col[1]
+
+if (length(attn_col) == 0) {
+  message("Attention question not found—keeping all rows.")
+  dat_attn <- dat
+  dat_attn$exclude_reason <- NA_character_
+} else {
+  keep_idx <- grepl("smart[[:space:]]*home", dat[[attn_col]], ignore.case = TRUE)
+  keep_idx[is.na(keep_idx)] <- FALSE  # treat NAs as failures
+  dat$exclude_reason <- ifelse(keep_idx, NA_character_, "attention_fail")
+  dat_attn <- dat[keep_idx, , drop = FALSE]
+  message(sprintf("Attention filter kept %d / %d rows.", sum(keep_idx, na.rm = TRUE), nrow(dat)))
+}
+```
+
+# Longstring (position-based), **SurveyWave-aware** exclusion of Q3 for Waves 1–2
+If `SurveyWave` is 1 or 2, we **exclude Q3** from the longstring per respondent; if 3, we include it. Threshold is the upper IQR fence (*Q3 + 1.5 × IQR*).
+
+```{r longstring, message=FALSE, warning=FALSE}
+# find SurveyWave column
+wave_col <- grep("^\\s*survey\\s*wave\\s*$", names(dat_attn), ignore.case = TRUE, value = TRUE)
+wave_num <- if (length(wave_col)) suppressWarnings(readr::parse_number(dat_attn[[wave_col[1]]])) else rep(NA_real_, nrow(dat_attn))
+
+# which position columns exist (coalesced per question)
+present_pos <- pos_cols_Q1_Q20[pos_cols_Q1_Q20 %in% names(dat_attn)]
+
+# identify Q3 position column(s)
+q3_pos <- if ("Q3_position" %in% names(dat_attn)) "Q3_position" else {
+  grep("^Q3(_.*)?_position$", names(dat_attn), value = TRUE)
+}
+q3_pos <- intersect(q3_pos, present_pos)
+
+# helper: longest run length (ignores NA)
+longest_run <- function(x) {
+  x <- x[!is.na(x)]
+  if (!length(x)) return(0L)
+  r <- rle(x)
+  max(r$lengths)
+}
+
+# build per-row set of columns to use based on SurveyWave
+use_cols_by_row <- lapply(seq_len(nrow(dat_attn)), function(i) {
+  cols <- present_pos
+  if (length(q3_pos) && !is.na(wave_num[i]) && wave_num[i] %in% c(1, 2)) {
+    cols <- setdiff(cols, q3_pos)  # exclude Q3 for Waves 1–2
+  }
+  cols
+})
+
+# compute row-wise longest run
+ls_run <- vapply(seq_along(use_cols_by_row), function(i) {
+  cols <- use_cols_by_row[[i]]
+  if (!length(cols)) return(0L)
+  v <- as.integer(dat_attn[i, cols, drop = FALSE])
+  longest_run(v)
+}, integer(1))
+
+# IQR fence threshold and flag
+q3p  <- stats::quantile(ls_run, 0.75, na.rm = TRUE)
+iqr  <- stats::IQR(ls_run, na.rm = TRUE)
+thr  <- q3p + 1.5 * iqr
+flag <- ls_run > thr
+
+dat_attn$longstring_run <- ls_run
+dat_attn$exclude_reason <- ifelse(is.na(dat_attn$exclude_reason) & flag, "longstring_outlier",
+                           ifelse(!is.na(dat_attn$exclude_reason) & flag,
+                                  paste(dat_attn$exclude_reason, "+ longstring_outlier"),
+                                  dat_attn$exclude_reason))
+dat_final <- dat_attn[!flag, , drop = FALSE]
+
+cat("SurveyWave-aware longstring: threshold >", round(thr, 2),
+    "| removed", sum(flag, na.rm = TRUE), "rows.\n")
+```
+
+# Covariates — screen **resolution** (height & area)
+We parse a `resolution`-like column to derive `res_height` and `res_area`.
+
+```{r covariates, message=FALSE, warning=FALSE}
+# detect a resolution column
+res_col <- grep("resolution", names(dat_final), ignore.case = TRUE, value = TRUE)
+if (length(res_col) > 1) res_col <- res_col[1]
+
+parse_resolution <- function(x) {
+  # Accept forms like "1920x1080", "1920 x 1080", "1080 × 1920", etc.
+  # Extract the first two integer numbers; if one number, return NA
+  nums <- as.integer(stringr::str_extract_all(x, "[0-9]+")[[1]])
+  if (length(nums) >= 2) {
+    # We don't know orientation; use min as height, max as width
+    h <- min(nums[1], nums[2], na.rm = TRUE)
+    w <- max(nums[1], nums[2], na.rm = TRUE)
+    c(width = w, height = h, area = w*h)
+  } else {
+    c(width = NA_integer_, height = NA_integer_, area = NA_integer_)
+  }
+}
+
+if (length(res_col)) {
+  res_mat <- t(vapply(dat_final[[res_col]], function(v) {
+    if (is.na(v) || !nzchar(v)) return(c(width=NA_integer_, height=NA_integer_, area=NA_integer_))
+    parse_resolution(v)
+  }, FUN.VALUE = c(width=0L, height=0L, area=0L)))
+
+  dat_final$res_width  <- as.integer(res_mat[, "width"])
+  dat_final$res_height <- as.integer(res_mat[, "height"])
+  dat_final$res_area   <- as.integer(res_mat[, "area"])
+  message("Resolution covariates added: res_height, res_area (and res_width).")
+} else {
+  message("No resolution column found; skipping resolution covariates.")
+}
+```
+
+# Quick summaries (optional)
+```{r summaries, message=FALSE}
+# attention status
+table(is.na(dat_attn$exclude_reason), useNA = "ifany")
+
+# longstring distribution
+summary(dat_attn$longstring_run)
+```
+
+# (Placeholder) Modeling examples
+Below are example models you can enable later (commented out), once you confirm variable names.
+
+```{r models, eval=FALSE}
+# Example: ANOVA without covariates on a score variable 'score'
+# dat_model <- dat_final
+# dat_model$hierarchy <- factor(dat_model$hierarchy, ordered = FALSE)
+# dat_model$chartjunk <- factor(dat_model$chartjunk, ordered = TRUE)
+# m1 <- aov(score ~ hierarchy * chartjunk, data = dat_model)
+# sjPlot::tab_model(m1)
+```

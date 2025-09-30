@@ -1,0 +1,289 @@
+---
+title: "Study 2 — Scoring, Attention Filter, Effects (future‑ready)"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(readr, dplyr, stringr, janitor, ggplot2, sjPlot, car, effectsize, emmeans, broom)
+
+# ---------- Set your data path here ----------
+# Use one of: forward slashes / double backslashes / raw string
+# path <- "D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation+-+Study+2_September+29,+2025_21.58.csv"
+
+# 3) R 4.0+ raw string
+path <- r"(D:\Dropbox\USD\Dissertation\Collab folder\Data\Dissertation+-+Study+2_September+30,+2025_10.01.csv)"
+
+```
+
+## Load + clean Qualtrics export (keep header row 2; drop ImportId row)
+
+```{r load_clean}
+# 1) Row 1 are labels; make Row 2 the header
+raw <- readr::read_csv(
+  path,
+  skip = 1,
+  col_types = readr::cols(.default = readr::col_character()),
+  show_col_types = FALSE
+)
+
+# 2) Remove the label/metadata row (the original row 3) if present
+dat <- raw %>%
+  dplyr::filter(!dplyr::if_any(dplyr::everything(), ~ grepl("\\bImportId\\b", .x, ignore.case = TRUE)))
+
+# Optional: clean names for convenience in parallel object
+dat_clean <- dat %>% janitor::clean_names()
+
+dat = dat %>%
+  filter(dat$`Response Type` != "Survey Preview")
+
+# Peek
+dplyr::glimpse(dat)
+```
+
+## Attention check → remove careless responders
+
+We drop anyone who **did not** answer “Smart Home” to **“What type of dashboard did you see?”**
+
+```{r attention_filter}
+# Find the attention-check column by name (case-insensitive; optional trailing '?')
+attn_col <- grep("^What type of dashboard did you see\\??$", names(dat), ignore.case = TRUE, value = TRUE)
+
+if (length(attn_col) == 0) {
+  message("Attention check column not found — no rows removed at this step.")
+  dat_attn <- dat
+} else {
+  # Keep rows that say 'smart home' (case-insensitive, allow whitespace variance)
+  keep_idx <- grepl("smart\\s*home", dat[[attn_col]], ignore.case = TRUE)
+  removed_n <- sum(!keep_idx, na.rm = TRUE)
+  message("Attention filter removed: ", removed_n, " row(s).")
+  dat_attn <- dat[keep_idx %in% TRUE, , drop = FALSE]
+}
+
+# If you want to also filter speeders (optional; uncomment and set a threshold)
+# dur_col <- grep("^Duration.*seconds\\)?$", names(dat_attn), ignore.case = TRUE, value = TRUE)
+# if (length(dur_col) == 1) {
+#   thr <- quantile(suppressWarnings(as.numeric(dat_attn[[dur_col]])), probs = 0.05, na.rm = TRUE)
+#   dat_attn <- dat_attn %>% dplyr::filter(suppressWarnings(as.numeric(.data[[dur_col]])) >= thr)
+# }
+```
+
+## Factors: chartjunk (ordinal) and hierarchy (nominal)
+
+```{r factors}
+dat_attn <- dat_attn %>% dplyr::mutate(version = as.character(.data[["Version"]] %||% .data[["version"]]))
+
+# Extract chartjunk (High/Medium/Low) and set ordered
+cj <- stringr::str_match(dat_attn$version, "(High|Medium|Low)Chartjunk$")[,2]
+dat_attn$chartjunk <- factor(cj, levels = c("Low","Medium","High"), ordered = TRUE)
+
+# Extract hierarchy by removing the tail
+hier_raw <- stringr::str_remove(dat_attn$version, "(High|Medium|Low)Chartjunk$")
+dat_attn$hierarchy <- dplyr::recode(hier_raw,
+  "NoHierarchy" = "none",
+  "FloorplanHierarchy" = "floorplan",
+  "RoomHierarchy" = "room",
+  "ImportanceHierarchy" = "importance",
+  .default = NA_character_
+) |> factor()
+
+# Sanity
+table(dat_attn$hierarchy, dat_attn$chartjunk, useNA = "ifany")
+```
+
+## Outcome: Score (use existing if present; otherwise from SC* columns)
+
+```{r outcome}
+# Prefer an existing 'Score' column if present
+score_col <- grep("^Score$", names(dat_attn), value = TRUE)
+if (length(score_col) == 1) {
+  dat_attn$Total_Score <- suppressWarnings(as.numeric(dat_attn[[score_col]]))
+  source_of_score <- "existing Score column"
+} else {
+  # Fall back to Qualtrics scoring categories SC0, SC1, ...
+  sc_cols <- grep("^SC\\d+$", names(dat_attn), value = TRUE)
+  if (length(sc_cols) == 0) {
+    warning("No Score column and no SC* columns found; Total_Score set to NA.")
+    dat_attn$Total_Score <- NA_real_
+    source_of_score <- "none"
+  } else {
+    dat_attn[sc_cols] <- lapply(dat_attn[sc_cols], function(x) suppressWarnings(as.numeric(x)))
+    dat_attn$Total_Score <- rowSums(dat_attn[sc_cols], na.rm = TRUE)
+    source_of_score <- "SC* sum"
+  }
+}
+message("Total_Score source: ", source_of_score)
+dat_attn$Percent_Score <- dat_attn$Total_Score / max(dat_attn$Total_Score, na.rm = TRUE) * 100
+summary(dat_attn[c("Total_Score","Percent_Score")])
+```
+
+```{r}
+# Packages
+if (!requireNamespace("sjPlot", quietly = TRUE)) install.packages("sjPlot")
+if (!requireNamespace("car", quietly = TRUE)) install.packages("car")
+library(sjPlot); library(car)
+
+# --- Data choice ---
+if (!exists("dat_attn")) stop("dat_attn not found. Build it first (post-attention-filter data).")
+
+# --- Detect columns ---
+score_var <- if ("Score" %in% names(dat_attn)) "Score" else
+             if ("Total_Score" %in% names(dat_attn)) "Total_Score" else
+             stop("No Score or Total_Score column found in dat_attn.")
+
+cj_var <- if ("chartjunk" %in% names(dat_attn)) "chartjunk" else
+          if ("charjunk" %in% names(dat_attn)) "charjunk" else
+          stop("No chartjunk/charjunk column found in dat_attn.")
+
+h_var <- if ("hierarchy" %in% names(dat_attn)) "hierarchy" else
+         stop("No hierarchy column found in dat_attn.")
+
+# --- Ensure factor types ---
+dat_attn[[h_var]]  <- as.factor(dat_attn[[h_var]])
+
+# Enforce Low < Medium < High if present; otherwise make ordered as-is
+if (all(c("Low","Medium","High") %in% unique(na.omit(dat_attn[[cj_var]])))) {
+  dat_attn[[cj_var]] <- factor(dat_attn[[cj_var]], levels = c("Low","Medium","High"), ordered = TRUE)
+} else {
+  dat_attn[[cj_var]] <- factor(dat_attn[[cj_var]], ordered = TRUE)
+}
+
+# Polynomial contrasts for ordered factor
+if (is.ordered(dat_attn[[cj_var]])) {
+  contrasts(dat_attn[[cj_var]]) <- contr.poly(length(levels(dat_attn[[cj_var]])))
+}
+
+# --- Fit model (no covariates) ---
+form <- as.formula(paste0(score_var, " ~ ", h_var, " * ", cj_var))
+cat("Model formula:", deparse(form), "\n")
+lm_model <- lm(form, data = dat_attn, na.action = na.exclude)
+
+# --- ANOVA (Type II) ---
+anova2 <- car::Anova(lm_model, type = 2)
+print(anova2)
+
+# --- sjPlot outputs ---
+# Coefficient table
+tab_model(lm_model,
+          title = "Score ~ Hierarchy * Chartjunk (no covariates)",
+          show.ci = FALSE, show.se = TRUE, show.stat = TRUE, show.p = TRUE,
+          dv.labels = score_var)
+
+# Interaction plot
+plot_model(lm_model, type = "int", terms = c(h_var, cj_var))
+# Optional marginal effects:
+# plot_model(lm_model, type = "eff", terms = h_var)
+# plot_model(lm_model, type = "eff", terms = cj_var)
+
+
+```
+
+
+## Covariates: resolution + the 4 post‑Q20 items (use if present)
+
+```{r covariates}
+# Explicit covariates by their survey question text
+covariates <- c(
+  "How often do you use data dashboards in your life?",
+  "How often do you use a smart home dashboard in your life?",
+  "How clear was the dashboard’s visual design (e.g., text readability, contrast, spacing)?",
+  "How clear was the dashboard's informational organization (grouping, labels, layout)?"
+)
+
+# Present-in-data detection supports raw & cleaned names
+present <- intersect(c(covariates, janitor::make_clean_names(covariates)), names(dat_attn))
+
+# Optional: coerce some types if found
+for (nm in present) {
+  # If it's a Likert from 1-5 etc., coerce to ordered numeric carefully
+  # Here we try numeric-first, otherwise leave as factor
+  suppressWarnings({
+    asnum <- as.numeric(dat_attn[[nm]])
+    if (!all(is.na(asnum))) dat_attn[[nm]] <- asnum
+  })
+}
+
+# resolution covariate
+res_col <- grep("^resolution$", names(dat_attn), ignore.case = TRUE, value = TRUE)
+covar_vec <- c(present, res_col)
+covar_vec <- unique(covar_vec[covar_vec %in% names(dat_attn)])
+
+cat("Covariates included:", paste(covar_vec, collapse = ", "), "\n")
+```
+
+## Model (future‑ready): `Total_Score ~ hierarchy * chartjunk + covariates`
+
+```{r model, fig.height=4.5, fig.width=7, message=FALSE, warning=FALSE}
+# Helper to backtick names safely
+bt <- function(x) paste0("`", gsub("`","``", x), "`")
+
+# Build formula with interaction + covariates
+rhs <- c("hierarchy * chartjunk", if (length(covar_vec)) bt(covar_vec) else NULL)
+form <- as.formula(paste("Total_Score ~", paste(rhs, collapse = " + ")))
+cat("Model formula:", deparse(form), "\n")
+
+# Fit
+lm_model <- lm(form, data = dat_attn)
+
+# Type II ANOVA (common with covariates)
+anova2 <- car::Anova(lm_model, type = 2)
+anova2
+```
+
+## Effect sizes (η², partial η², ω²)
+
+```{r effects}
+# From the fitted model
+eta <- effectsize::eta_squared(lm_model, partial = FALSE, ci = 0.90)
+eta_p <- effectsize::eta_squared(lm_model, partial = TRUE, ci = 0.90)
+omega <- effectsize::omega_squared(lm_model, partial = FALSE, ci = 0.90)
+
+list(
+  eta_squared = eta,
+  partial_eta_squared = eta_p,
+  omega_squared = omega
+)
+```
+
+## Estimated marginal means (optional) and interaction plot
+
+```{r emmeans_plot, fig.height=4.5, fig.width=7, message=FALSE, warning=FALSE}
+# Only if factors exist
+if (all(c("hierarchy","chartjunk") %in% names(dat_attn))) {
+  sjPlot::plot_model(lm_model, type = "int", terms = c("hierarchy","chartjunk"))
+}
+```
+
+## Cell means
+
+```{r cell_means}
+cell_means <- dat_attn %>%
+  dplyr::group_by(hierarchy, chartjunk) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean_total = mean(Total_Score, na.rm = TRUE),
+    sd_total = stats::sd(Total_Score, na.rm = TRUE),
+    .groups = "drop"
+  )
+cell_means
+```
+
+## QA: exclusions + missingness report
+
+```{r qa}
+# Count exclusions (attention)
+total_n <- nrow(dat)
+kept_n  <- nrow(dat_attn)
+cat("Total rows:", total_n, " | Kept after attention filter:", kept_n, " | Removed:", total_n - kept_n, "\n")
+
+# Missingness in covariates used
+if (length(covar_vec)) {
+  miss <- dat_attn %>%
+    dplyr::summarise(across(all_of(covar_vec), ~ mean(is.na(.x), na.rm = TRUE))) %>%
+    tidyr::pivot_longer(dplyr::everything(), names_to = "var", values_to = "pct_missing")
+  miss
+}
+```
