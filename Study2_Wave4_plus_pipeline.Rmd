@@ -1,0 +1,509 @@
+---
+title: "Study 2 — Wave4+ Clean Pipeline (Attention + Hardcoded Longstring)"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = TRUE, warning = TRUE)
+options(cli.num_colors = 1, crayon.enabled = FALSE)
+```
+
+# 0) Config
+
+- **Edit the `path`** below to your CSV export.
+- Column names are **hard-coded** to your Wave4+ survey. If your export uses different labels, adjust in the **Column Map** section.
+- This file creates:  
+  - `FirstItem` … `SeventhItem` (1–4: position of selected choice)  
+  - `longstring_run` via `{careless}` across those seven items  
+  - `exclude_reason` with `"attention_fail"` and `"longstring_outlier"`  
+  - `dat_final` after all exclusions
+
+```{r config}
+# ---- PATH ----
+path <- r"(D:\Dropbox\USD\Dissertation\Collab folder\Data\Dissertation+-+Study+2+-+Wave4+_October+6,+2025_15.23.csv)"
+```
+
+# 1) Packages
+
+```{r packages}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(readr, dplyr, stringr, ggplot2, broom, effectsize, careless)
+```
+
+# 2) Load
+
+```{r load}
+raw0 <- readr::read_csv(
+  path,
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+)
+
+# Drop the first two header-ish rows (labels + ImportId JSON)
+stopifnot(nrow(raw0) >= 3)
+dat <- raw0[-c(1,2), , drop = FALSE]
+
+# Keep finished only (exact header "Finished")
+dat <- dat %>% filter(Finished %in% c("True","true","1"))
+
+# Coerce duration and score
+dat[["Duration (in seconds)"]] <- suppressWarnings(as.numeric(dat[["Duration (in seconds)"]]))
+dat[["SC0"]]                   <- suppressWarnings(as.numeric(dat[["SC0"]]))
+dat$score <- dat[["SC0"]]
+
+stopifnot(nrow(dat) > 0)
+stopifnot(!all(is.na(dat$score)))
+```
+
+# 3) Derive factors (Version → hierarchy & chartjunk)
+
+```{r factors}
+stopifnot("Version" %in% names(dat))
+dat$Version <- stringr::str_squish(dat$Version)
+
+chart <- stringr::str_match(dat$Version, "(High|Medium|Low)Chartjunk$")[,2]
+hier  <- stringr::str_remove(dat$Version, "(High|Medium|Low)Chartjunk$")
+
+dat$chartjunk <- factor(chart, levels = c("Low","Medium","High"), ordered = TRUE)
+dat$hierarchy <- factor(
+  dplyr::recode(hier,
+    "NoHierarchy"         = "NoHierarchy",
+    "FloorplanHierarchy"  = "FloorplanHierarchy",
+    "RoomHierarchy"       = "RoomHierarchy",
+    "ImportanceHierarchy" = "ImportanceHierarchy",
+    .default = NA_character_
+  ),
+  levels = c("NoHierarchy","FloorplanHierarchy","RoomHierarchy","ImportanceHierarchy")
+)
+```
+
+# 4) Column Map (hard-coded)
+
+These are the exact headers expected in your Wave4+ export. Adjust here if your CSV labels differ.
+
+```{r colmap}
+# === Column Map (Wave4+ CSV using QIDs) ===
+# AN display order (tokens like Q1|Q9|...|MetaInfo)
+COL_AN      <- "Gistblock_DO"
+
+# Seven items (Q1 & Q18 have per-row randomized choice order)
+COL_Q1      <- "Q1"
+COL_Q1_DO   <- "Q1_DO"
+
+COL_Q9      <- "Q9"
+COL_Q10     <- "Q10"
+COL_Q14     <- "Q14"
+COL_Q17     <- "Q17"
+
+COL_Q18     <- "Q18"
+COL_Q18_DO  <- "Q18_DO"
+
+# Attention item (also one of the seven)
+COL_Q20     <- "Q20"
+
+# Fixed (non-DO) choice orders for 4-option questions
+# (coerce source columns to character so match() works even if CSV parsed numerics)
+dat[[COL_Q10]] <- as.character(dat[[COL_Q10]])
+dat[[COL_Q14]] <- as.character(dat[[COL_Q14]])
+dat[[COL_Q17]] <- as.character(dat[[COL_Q17]])
+dat[[COL_Q9 ]] <- trimws(as.character(dat[[COL_Q9 ]]))
+dat[[COL_Q20]] <- trimws(as.character(dat[[COL_Q20]]))
+
+CHO_Q9  <- c("North","South","East","West")
+CHO_Q10 <- c("0","1","2","3")
+CHO_Q14 <- c("1","2","3","4")
+CHO_Q17 <- c("0","1","2","3")
+CHO_Q20 <- c("Smart home","IT infrastructure","Hospital bed display","Stock ticker")
+
+req_cols <- c(COL_AN,COL_Q1,COL_Q1_DO,COL_Q9,COL_Q10,COL_Q14,COL_Q17,COL_Q18,COL_Q18_DO,COL_Q20)
+if (!all(req_cols %in% names(dat))) {
+  stop("Missing columns: ", paste(setdiff(req_cols, names(dat)), collapse = ", "))
+}
+
+```
+
+# 5) Attention filter (Q20 must contain "smart home")
+
+```{r attention}
+keep_idx <- grepl("smart[[:space:]]*home", dat[[COL_Q20]], ignore.case = TRUE)
+keep_idx[is.na(keep_idx)] <- FALSE
+
+dat$exclude_reason <- ifelse(keep_idx, NA_character_, "attention_fail")
+dat_attn <- dat[keep_idx, , drop = FALSE]
+
+message(sprintf("Attention filter kept %d / %d rows.", sum(keep_idx, na.rm = TRUE), nrow(dat)))
+```
+
+# 6) Build FirstItem…SeventhItem (1–4 positions)
+
+Rules:
+- Parse `COL_AN` (pipe-separated tokens) → drop `MetaInfo` → take the first seven tokens as the **seen order**.
+- Map each token to one of `{Q1, Q9, Q10, Q14, Q17, Q18, Q20}`.
+- For Q1 & Q18, compute the selected **position** from the per-row “- Display Order” columns.
+- For fixed-order items, compute the position via `match(selected, CHO_*)`.
+
+```{r first_to_seventh}
+# 6a) Parse AN into seven tokens per row
+ORD_LIST <- strsplit(dat_attn[[COL_AN]], "\\|", perl = TRUE)
+ORD_LIST <- lapply(ORD_LIST, function(v) {
+  v <- v[!grepl("^\\s*MetaInfo\\s*$", v, ignore.case = TRUE)]
+  if (length(v) >= 7) v[1:7] else c(v, rep(NA_character_, 7 - length(v)))
+})
+
+# 6b) Selected positions per item (1..4)
+
+# Q1 and Q18: position derived from their row-specific Display Order
+POS_Q1 <- as.integer(mapply(function(ans, do) {
+  if (is.na(ans) || is.na(do)) return(NA_integer_)
+  ch <- strsplit(do, "\\|", perl = TRUE)[[1]]
+  match(ans, ch)
+}, dat_attn[[COL_Q1]], dat_attn[[COL_Q1_DO]]))
+
+POS_Q18 <- as.integer(mapply(function(ans, do) {
+  if (is.na(ans) || is.na(do)) return(NA_integer_)
+  ch <- strsplit(do, "\\|", perl = TRUE)[[1]]
+  match(ans, ch)
+}, dat_attn[[COL_Q18]], dat_attn[[COL_Q18_DO]]))
+
+# Fixed-order items
+POS_Q9  <- as.integer(match(dat_attn[[COL_Q9]],  CHO_Q9))
+POS_Q10 <- as.integer(match(dat_attn[[COL_Q10]], CHO_Q10))
+POS_Q14 <- as.integer(match(dat_attn[[COL_Q14]], CHO_Q14))
+POS_Q17 <- as.integer(match(dat_attn[[COL_Q17]], CHO_Q17))
+POS_Q20 <- as.integer(match(dat_attn[[COL_Q20]], CHO_Q20))
+
+# Mapping token → vector of positions in fixed order c(Q1,Q9,Q10,Q14,Q17,Q18,Q20)
+QKEYS <- c("Q1","Q9","Q10","Q14","Q17","Q18","Q20")
+
+# Helper inline (no separate functions): index into the packed vector by token
+pick_by_token <- function(tok, p1,p9,p10,p14,p17,p18,p20) {
+  idx <- match(tok, QKEYS)
+  c(p1,p9,p10,p14,p17,p18,p20)[idx]
+}
+
+FirstItem   <- as.integer(mapply(function(ord, p1,p9,p10,p14,p17,p18,p20) pick_by_token(ord[1], p1,p9,p10,p14,p17,p18,p20),
+                                ORD_LIST, POS_Q1, POS_Q9, POS_Q10, POS_Q14, POS_Q17, POS_Q18, POS_Q20))
+SecondItem  <- as.integer(mapply(function(ord, p1,p9,p10,p14,p17,p18,p20) pick_by_token(ord[2], p1,p9,p10,p14,p17,p18,p20),
+                                ORD_LIST, POS_Q1, POS_Q9, POS_Q10, POS_Q14, POS_Q17, POS_Q18, POS_Q20))
+ThirdItem   <- as.integer(mapply(function(ord, p1,p9,p10,p14,p17,p18,p20) pick_by_token(ord[3], p1,p9,p10,p14,p17,p18,p20),
+                                ORD_LIST, POS_Q1, POS_Q9, POS_Q10, POS_Q14, POS_Q17, POS_Q18, POS_Q20))
+FourthItem  <- as.integer(mapply(function(ord, p1,p9,p10,p14,p17,p18,p20) pick_by_token(ord[4], p1,p9,p10,p14,p17,p18,p20),
+                                ORD_LIST, POS_Q1, POS_Q9, POS_Q10, POS_Q14, POS_Q17, POS_Q18, POS_Q20))
+FifthItem   <- as.integer(mapply(function(ord, p1,p9,p10,p14,p17,p18,p20) pick_by_token(ord[5], p1,p9,p10,p14,p17,p18,p20),
+                                ORD_LIST, POS_Q1, POS_Q9, POS_Q10, POS_Q14, POS_Q17, POS_Q18, POS_Q20))
+SixthItem   <- as.integer(mapply(function(ord, p1,p9,p10,p14,p17,p18,p20) pick_by_token(ord[6], p1,p9,p10,p14,p17,p18,p20),
+                                ORD_LIST, POS_Q1, POS_Q9, POS_Q10, POS_Q14, POS_Q17, POS_Q18, POS_Q20))
+SeventhItem <- as.integer(mapply(function(ord, p1,p9,p10,p14,p17,p18,p20) pick_by_token(ord[7], p1,p9,p10,p14,p17,p18,p20),
+                                ORD_LIST, POS_Q1, POS_Q9, POS_Q10, POS_Q14, POS_Q17, POS_Q18, POS_Q20))
+
+dat_attn$FirstItem   <- FirstItem
+dat_attn$SecondItem  <- SecondItem
+dat_attn$ThirdItem   <- ThirdItem
+dat_attn$FourthItem  <- FourthItem
+dat_attn$FifthItem   <- FifthItem
+dat_attn$SixthItem   <- SixthItem
+dat_attn$SeventhItem <- SeventhItem
+```
+
+# 7) Longstring via `{careless}`
+
+We compute longest run across the seven 1–4 codes. To avoid NA runs, we replace missing entries with **unique per-column sentinels** so consecutive NAs never match.
+
+```{r longstring}
+ls_mat <- dat_attn[, c("FirstItem","SecondItem","ThirdItem","FourthItem","FifthItem","SixthItem","SeventhItem")]
+
+# Clean blanks → NA_integer_
+for (j in seq_along(ls_mat)) {
+  x <- ls_mat[[j]]
+  x[x %in% c("", "NA")] <- NA
+  ls_mat[[j]] <- suppressWarnings(as.integer(x))
+}
+
+# Replace NA with unique per-column codes (breaks NA runs)
+for (j in seq_along(ls_mat)) {
+  idx <- is.na(ls_mat[[j]])
+  if (any(idx)) ls_mat[[j]][idx] <- -j
+}
+
+dat_attn$longstring_run <- as.integer(careless::longstring(ls_mat))
+
+# Tukey fence to flag outliers; set fixed cutoff if preferred
+q3  <- stats::quantile(dat_attn$longstring_run, 0.75, na.rm = TRUE)
+iqr <- stats::IQR(dat_attn$longstring_run, na.rm = TRUE)
+thr <- q3 + 1.5 * iqr
+flag <- !is.na(dat_attn$longstring_run) & dat_attn$longstring_run > thr
+
+dat_attn$exclude_reason <- ifelse(
+  is.na(dat_attn$exclude_reason) & flag, "longstring_outlier",
+  ifelse(!is.na(dat_attn$exclude_reason) & flag,
+         paste(dat_attn$exclude_reason, "+ longstring_outlier"),
+         dat_attn$exclude_reason)
+)
+
+dat_final <- dat_attn[!flag, , drop = FALSE]
+
+cat("Longstring on First..Seventh: threshold >", round(thr, 2),
+    "| removed", sum(flag, na.rm = TRUE), "rows.\n")
+```
+
+# 8) Quick EDA (optional)
+
+```{r eda, fig.width=7, fig.height=4}
+# Score ~ hierarchy
+ggplot(dat_final, aes(hierarchy, score)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = .12, outlier.shape = NA) +
+  geom_jitter(width = .12, height = 0, alpha = .25, size = 1) +
+  labs(y = "Score", x = "Hierarchy") +
+  theme_minimal(base_size = 12)
+
+# Score ~ chartjunk
+ggplot(dat_final, aes(chartjunk, score)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = .12, outlier.shape = NA) +
+  geom_jitter(width = .12, height = 0, alpha = .25, size = 1) +
+  labs(x = "Chartjunk", y = "Score") +
+  theme_minimal(base_size = 12)
+```
+
+# 9) Sanity tables
+
+```{r sanity}
+table(dat_attn$exclude_reason, useNA = "ifany")
+summary(dat_attn$longstring_run)
+
+# Peek at the First..Seventh encodings
+head(dat_attn[, c("FirstItem","SecondItem","ThirdItem","FourthItem","FifthItem","SixthItem","SeventhItem")], 10)
+```
+
+# 10) Session info
+
+```{r session}
+sessionInfo()
+```
+
+
+```{r}
+# ---- ANCOVA: adjust for dashboard use (Never vs Otherwise) ----
+suppressPackageStartupMessages({
+  library(car)
+  library(emmeans)
+  library(effectsize)
+  library(ggplot2)
+})
+
+# 1) Recode usage to binary factor (ref = Otherwise)
+dat_final$use_never <- ifelse(tolower(trimws(dat_final$DataDashboardUsage)) == "never",
+                              "Never", "Otherwise")
+dat_final$use_never <- factor(dat_final$use_never, levels = c("Otherwise","Never"))
+
+# (Optional) sanity check
+table(dat_final$use_never, useNA = "ifany")
+
+# 2) Fit ANCOVA (binary covariate)
+m_anc <- lm(score ~ hierarchy * chartjunk + use_never, data = dat_final)
+
+# 3) Type-III tests with sum contrasts
+old_contr <- options(contrasts = c("contr.sum","contr.poly"))
+anc_tests <- car::Anova(m_anc, type = 3)
+options(old_contr)
+
+anc_tests
+
+# 4) Effect sizes (partial eta^2)
+eta_squared(anc_tests, partial = TRUE)
+
+# 5) Adjusted means (EMMs) for hierarchy x chartjunk
+#    weights = "proportional" averages over use_never by its sample proportions.
+#    If you prefer equal weighting across use_never levels, set weights = "equal".
+emm_anc <- emmeans(m_anc, ~ hierarchy * chartjunk, weights = "proportional")
+confint(emm_anc)
+
+# 6) Plot adjusted means with 95% CIs
+emm_df <- as.data.frame(confint(emm_anc))
+ggplot(emm_df, aes(hierarchy, emmean, group = chartjunk, color = chartjunk)) +
+  geom_line(position = position_dodge(width = .2)) +
+  geom_point(position = position_dodge(width = .2), size = 2.5) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                width = .12, position = position_dodge(width = .2)) +
+  labs(x = "Hierarchy", y = "Adjusted mean score (ANCOVA)",
+       color = "Chartjunk") +
+  theme_minimal(base_size = 12)
+
+# 7) (Optional) follow-ups
+# Pairwise simple effects of chartjunk within each hierarchy (Tukey-adjusted)
+pairs(emmeans(m_anc, ~ chartjunk | hierarchy, weights = "proportional"),
+      adjust = "tukey")
+
+# Pairwise simple effects of hierarchy within each chartjunk
+pairs(emmeans(m_anc, ~ hierarchy | chartjunk, weights = "proportional"),
+      adjust = "tukey")
+
+# 8) (Optional) model diagnostics
+par(mfrow = c(1,2))
+plot(m_anc, which = 1)  # Residuals vs Fitted
+plot(m_anc, which = 2)  # Normal Q-Q
+par(mfrow = c(1,1))
+
+```
+
+```{r}
+# ---- sjPlot visuals (ANCOVA) ----
+pacman::p_load(sjPlot, sjlabelled)
+
+# Optional: consistent look + quiet color codes in console
+theme_set(sjPlot::theme_sjplot())
+options(cli.num_colors = 1, crayon.enabled = FALSE)
+
+# 1) Interaction: hierarchy × chartjunk (averages over use_never by sample mix)
+p_int <- sjPlot::plot_model(
+  m_anc,
+  type  = "int",
+  terms = c("hierarchy", "chartjunk"),   # x, group
+  ci.lvl = 0.95
+) + labs(x = "Hierarchy", y = "Adjusted mean score") +
+    guides(linetype = "none", shape = "none")
+p_int
+
+# 2) Predicted means, explicitly showing both use_never levels
+# terms = c(x, group, facet)
+p_pred <- sjPlot::plot_model(
+  m_anc,
+  type  = "pred",
+  terms = c("hierarchy", "chartjunk", "use_never")
+) + labs(x = "Hierarchy", y = "Adjusted mean score", color = "Chartjunk") +
+    guides(linetype = "none", shape = "none")
+p_pred
+
+# 3) Coefficient forest (fixed effects with 95% CI)
+p_coef <- sjPlot::plot_model(
+  m_anc,
+  type = "est",          # estimated coefficients
+  show.values = TRUE,
+  value.offset = .2
+) + labs(x = NULL, y = "Coefficient (±95% CI)")
+p_coef
+
+# 4) Model table (nice HTML output in the notebook)
+sjPlot::tab_model(
+  m_anc,
+  dv.labels = "Score (ANCOVA)",
+  show.ci = TRUE,
+  show.std = TRUE,
+  p.style = "stars",
+  string.pred = "Predictor",
+  string.est  = "b"
+)
+
+```
+
+```{r}
+m_mod <- lm(score ~ hierarchy * chartjunk * use_never, data = dat_final)
+car::Anova(m_mod, type = 3)
+
+```
+```{r}
+m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
+m_anc <- lm(score ~ hierarchy * chartjunk + use_never, data = dat_final)
+
+anova(m_aov, m_anc)   # nested F-test
+AIC(m_aov, m_anc); BIC(m_aov, m_anc)
+
+```
+```{r}
+# --- Final 2×3 ANOVA (no covariate) ---
+library(car); library(emmeans); library(effectsize); library(sjPlot)
+
+m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
+
+# Type III with sum contrasts (reporting-friendly)
+oldc <- options(contrasts = c("contr.sum","contr.poly"))
+aov_tests <- car::Anova(m_aov, type = 3)
+options(oldc)
+
+aov_tests
+effectsize::eta_squared(aov_tests, partial = TRUE)
+
+# EMMs + pairwise (Tukey)
+emm <- emmeans(m_aov, ~ hierarchy * chartjunk)
+pairs(emmeans(m_aov, ~ chartjunk | hierarchy), adjust = "tukey")
+pairs(emmeans(m_aov, ~ hierarchy | chartjunk), adjust = "tukey")
+
+# Plot (report-friendly)
+theme_set(sjPlot::theme_sjplot())
+sjPlot::plot_model(m_aov, type = "int",
+                   terms = c("hierarchy","chartjunk"), ci.lvl = 0.95) +
+  labs(x = "Hierarchy", y = "Estimated mean score") +
+  guides(linetype = "none", shape = "none")
+
+# (Optional) basic assumptions
+car::leveneTest(score ~ interaction(hierarchy, chartjunk), data = dat_final)
+par(mfrow = c(1,2)); plot(m_aov, which = 1); plot(m_aov, which = 2); par(mfrow = c(1,1))
+
+```
+
+```{r}
+# 1) Omnibus 2×3 ANOVA + effect sizes
+options(contrasts = c("contr.sum","contr.poly"))
+m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
+aov_tab <- car::Anova(m_aov, type = 3); aov_tab
+effectsize::eta_squared(aov_tab, partial = TRUE)
+
+# 2) Planned linear trend for chartjunk (it’s ordered)
+# overall (balanced over hierarchy) and within each hierarchy
+library(emmeans)
+emm_cj   <- emmeans(m_aov, ~ chartjunk, weights = "equal")
+contrast(emm_cj, "poly")              # look at the Linear row
+
+emm_cj_h <- emmeans(m_aov, ~ chartjunk | hierarchy, weights = "equal")
+contrast(emm_cj_h, "poly")            # Linear per-hierarchy
+
+# 3) Simple effects of chartjunk within each hierarchy (Tukey)
+pairs(emm_cj_h, adjust = "tukey")
+
+# (Optional) visualize the monotone look you’re seeing
+emm_df <- as.data.frame(confint(emm_cj_h))
+ggplot(emm_df, aes(chartjunk, emmean, group = hierarchy, color = hierarchy)) +
+  geom_line(position = position_dodge(.2)) +
+  geom_point(position = position_dodge(.2)) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                width = .12, position = position_dodge(.2)) +
+  labs(x = "Chartjunk", y = "Estimated mean score (balanced)") +
+  theme_minimal(base_size = 12)
+
+```
+```{r}
+# ensure ordered levels
+dat_final$chartjunk <- factor(dat_final$chartjunk,
+                               levels = c("Low","Medium","High"),
+                               ordered = TRUE)
+
+# contrasts: sum for hierarchy (Type III friendly), polynomial for chartjunk
+contrasts(dat_final$hierarchy) <- contr.sum(4)
+contrasts(dat_final$chartjunk)  <- contr.poly(3)
+
+# refit the 2×3 model
+m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
+
+# overall Type III tests
+car::Anova(m_aov, type = 3)
+
+```
+
+```{r}
+library(emmeans)
+
+# overall linear trend for chartjunk (balanced over hierarchy)
+emm_cj <- emmeans(m_aov, ~ chartjunk, weights = "equal")
+contrast(emm_cj, "poly")   # check the "Linear" row
+
+# linear trend within each hierarchy
+emm_cj_h <- emmeans(m_aov, ~ chartjunk | hierarchy, weights = "equal")
+contrast(emm_cj_h, "poly") # Linear per hierarchy level
+
+```
+

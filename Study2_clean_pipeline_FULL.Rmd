@@ -1,0 +1,954 @@
+---
+title: "Study 2 — Clean Pipeline"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+---
+
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(readr, dplyr, stringr, janitor, ggplot2, jsonlite, car, effectsize,
+               sjPlot, emmeans, broom, purrr, tibble, tidyr, rlang)
+
+theme_set(sjPlot::theme_sjplot())
+options(contrasts = c("contr.treatment", "contr.poly"))
+`%||%` <- function(a,b) if (is.null(a) || length(a)==0) b else a
+```
+
+# 1) Paths & raw data load
+
+```{r paths-and-load, message=FALSE, warning=FALSE}
+# EDIT these if your paths differ
+csv_path <- r"(D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation+-+Study+2_September+30,+2025_19.12.csv)"
+qsf_path <- r"(D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation_-_Study_2.qsf)"
+stopifnot(file.exists(csv_path), file.exists(qsf_path))
+
+raw <- readr::read_csv(csv_path, skip = 1,
+                       col_types = readr::cols(.default = readr::col_character()),
+                       show_col_types = FALSE)
+
+# drop the Qualtrics metadata row (ImportId)
+dat <- raw %>%
+  dplyr::filter(!dplyr::if_any(dplyr::everything(), ~ grepl("ImportId", .x, fixed = TRUE)))
+
+dat = dat %>%
+  filter(`Response Type` != "Survey Preview")
+
+dat_orig <- dat
+nrow(dat)
+```
+
+# 2) QSF → item metadata (Q1–Q20), positions per row
+
+```{r qsf-to-positions, message=FALSE, warning=FALSE}
+# ---- Read QSF ----
+qsf <- jsonlite::fromJSON(qsf_path, simplifyVector = FALSE)
+sq  <- Filter(function(el) identical(el$Element, "SQ"), qsf$SurveyElements)
+
+get_tag   <- function(p) p$DataExportTag %||% NA_character_
+get_qid   <- function(p) p$QuestionID    %||% NA_character_
+get_text  <- function(p) p$QuestionText  %||% NA_character_
+get_rand  <- function(p) { ra <- p$Randomization %||% list(); isTRUE(ra$Advanced) || isTRUE(ra$RandomizeAnswers) || !is.null(ra$Type) }
+get_choice_order <- function(p) { ord <- p$ChoiceOrder %||% names(p$Choices); unname(as.character(ord)) }
+get_choices_tbl <- function(p) {
+  ch <- p$Choices %||% list()
+  keys <- names(ch) %||% character(0)
+  if (!length(keys)) return(tibble::tibble(key=character(0), text=character(0), recode=character(0)))
+  rv <- p$RecodeValues %||% list()
+  recode_vec <- vapply(keys, function(k) as.character(rv[[k]] %||% NA_character_), character(1))
+  tibble::tibble(key = as.character(keys),
+                 text = vapply(ch, function(x) x$Display %||% "", character(1)),
+                 recode = recode_vec)
+}
+
+q_meta <- lapply(sq, function(el) {
+  p <- el$Payload
+  tibble::tibble(tag=get_tag(p), qid=get_qid(p), text=get_text(p), randomize=get_rand(p),
+                 choice_order_default=list(get_choice_order(p)),
+                 choices=list(get_choices_tbl(p)))
+}) %>%
+  dplyr::bind_rows() %>%
+  dplyr::filter(!is.na(tag), grepl("^Q([1-9]|1[0-9]|20)$", tag)) %>%
+  dplyr::arrange(factor(tag, levels = paste0("Q", 1:20)))
+
+# ---- Match QSF text to CSV question columns ----
+find_csv_col <- function(q_text, cols){
+  m <- which(cols == q_text)[1]; if (!is.na(m)) return(cols[m])
+  m <- which(startsWith(cols, q_text))[1]; if (!is.na(m)) return(cols[m])
+  NA_character_
+}
+cols <- names(dat)
+q_meta <- q_meta %>% dplyr::mutate(
+  csv_col       = vapply(text, find_csv_col, character(1), cols = cols),
+  csv_col_order = ifelse(is.na(csv_col), NA_character_, paste0(csv_col, " - Display Order"))
+)
+
+# ---- Helpers: normalize to choice KEYS; parse DO tokens ----
+answer_to_key <- function(answer_val, choices){
+  if (is.na(answer_val) || !length(choices$key)) return(NA_character_)
+  ans <- as.character(answer_val)
+  idx <- match(ans, choices$text);    if (!is.na(idx)) return(choices$key[idx])
+  idx <- match(ans, choices$recode);  if (!is.na(idx)) return(choices$key[idx])
+  lead <- stringr::str_extract(ans, "[0-9]+")
+  if (!is.na(lead) && lead %in% choices$key) return(lead)
+  if (ans %in% choices$key) return(ans)
+  NA_character_
+}
+
+order_to_keys <- function(order_str, choices, default_keys){
+  if (is.na(order_str) || !nzchar(order_str)) return(default_keys)
+  # detect delimiter without escapes
+  delim <- if (grepl("[|]", order_str)) "[|]" else if (grepl(";", order_str)) ";" else ","
+  toks <- trimws(unlist(strsplit(order_str, delim)))
+  if (!length(toks)) return(default_keys)
+  if (all(toks %in% choices$key))  return(toks)
+  if (all(toks %in% choices$text)) return(choices$key[match(toks, choices$text)])
+  lead <- stringr::str_extract(toks, "[0-9]+")
+  if (all(lead %in% choices$key))  return(lead)
+  default_keys
+}
+
+# ---- Per‑QID positions, then coalesce to Q*_position ----
+for (i in seq_len(nrow(q_meta))) {
+  meta <- q_meta[i, ]
+  qcol <- meta$csv_col
+  if (is.na(qcol)) next
+  odcol    <- meta$csv_col_order
+  choices  <- meta$choices[[1]]
+  def_keys <- meta$choice_order_default[[1]]
+  qid      <- meta$qid
+  tag      <- meta$tag
+  pos_name <- paste0(tag, "_", qid, "_position")
+
+  ans_keys <- vapply(dat[[qcol]], answer_to_key, character(1), choices = choices)
+
+  ord_keys <- if (!is.na(odcol) && odcol %in% names(dat)) {
+    lapply(dat[[odcol]], order_to_keys, choices = choices, default_keys = def_keys)
+  } else {
+    rep(list(def_keys), nrow(dat))
+  }
+
+  pos <- mapply(function(k, ord) {
+    if (is.na(k) || !length(ord)) return(NA_integer_)
+    p <- match(k, ord)
+    if (is.na(p)) NA_integer_ else as.integer(p)
+  }, ans_keys, ord_keys, SIMPLIFY = TRUE, USE.NAMES = FALSE)
+
+  dat[[pos_name]] <- as.integer(pos)
+}
+
+# Coalesce all QID variants to a single tag-level column
+tags <- unique(q_meta$tag)
+for (tg in tags) {
+  cols_tg <- grep(paste0("^", tg, "_.*_position$"), names(dat), value = TRUE)
+  if (length(cols_tg)) {
+    dat[[paste0(tg, "_position")]] <- purrr::reduce(dat[cols_tg], dplyr::coalesce) %>% as.integer()
+  }
+}
+
+pos_cols_Q1_Q20 <- paste0("Q", 1:20, "_position")
+pos_cols_Q1_Q20 <- pos_cols_Q1_Q20[pos_cols_Q1_Q20 %in% names(dat)]
+length(pos_cols_Q1_Q20)
+```
+
+# 3) Attention filter (“Smart Home”)
+
+```{r attention}
+attn_col <- grep("^What type of dashboard did you see[?]?$", names(dat),
+                 ignore.case = TRUE, value = TRUE)
+if (length(attn_col) > 1) attn_col <- attn_col[1]
+
+if (!length(attn_col)) {
+  message("Attention question not found — keeping all rows.")
+  dat_attn <- dat; dat_attn$exclude_reason <- NA_character_
+} else {
+  keep_idx <- grepl("smart[[:space:]]*home", dat[[attn_col]], ignore.case = TRUE)
+  keep_idx[is.na(keep_idx)] <- FALSE
+  dat$exclude_reason <- ifelse(keep_idx, NA_character_, "attention_fail")
+  dat_attn <- dat[keep_idx, , drop = FALSE]
+  message(sprintf("Attention filter kept %d / %d rows.", sum(keep_idx, na.rm = TRUE), nrow(dat)))
+}
+
+```
+
+# 4) Longstring on positions (SurveyWave-aware: exclude Q3 for Waves 1–2)
+
+```{r longstring, message=FALSE, warning=FALSE}
+# find SurveyWave
+wave_col <- grep("^[[:space:]]*survey[[:space:]]*wave[[:space:]]*$", names(dat_attn),
+                 ignore.case = TRUE, value = TRUE)
+wave_num <- if (length(wave_col) > 0) suppressWarnings(readr::parse_number(dat_attn[[wave_col[1]]])) else rep(NA_real_, nrow(dat_attn))
+
+
+present_pos <- pos_cols_Q1_Q20[pos_cols_Q1_Q20 %in% names(dat_attn)]
+
+q3_pos <- if ("Q3_position" %in% names(dat_attn)) "Q3_position" else {
+  grep("^Q3(_.*)?_position$", names(dat_attn), value = TRUE)
+}
+q3_pos <- intersect(q3_pos, present_pos)
+
+longest_run <- function(x) {
+  x <- x[!is.na(x)]
+  if (!length(x)) return(0L)
+  r <- rle(x); max(r$lengths)
+}
+
+use_cols_by_row <- lapply(seq_len(nrow(dat_attn)), function(i) {
+  cols <- present_pos
+  if (length(q3_pos) && !is.na(wave_num[i]) && wave_num[i] %in% c(1, 2)) {
+    cols <- setdiff(cols, q3_pos)
+  }
+  cols
+})
+
+ls_run <- vapply(seq_along(use_cols_by_row), function(i) {
+  cols <- use_cols_by_row[[i]]
+  if (!length(cols)) return(0L)
+  v <- as.integer(dat_attn[i, cols, drop = FALSE])
+  longest_run(v)
+}, integer(1))
+
+q3p  <- stats::quantile(ls_run, 0.75, na.rm = TRUE)
+iqr  <- stats::IQR(ls_run, na.rm = TRUE)
+thr  <- q3p + 1.5 * iqr
+flag <- ls_run > thr
+
+dat_attn$longstring_run <- ls_run
+dat_attn$exclude_reason <- ifelse(is.na(dat_attn$exclude_reason) & flag, "longstring_outlier",
+                           ifelse(!is.na(dat_attn$exclude_reason) & flag,
+                                  paste(dat_attn$exclude_reason, "+ longstring_outlier"),
+                                  dat_attn$exclude_reason))
+dat_final <- dat_attn[!flag, , drop = FALSE]
+
+cat("SurveyWave-aware longstring: threshold >", round(thr, 2),
+    "| removed", sum(flag, na.rm = TRUE), "rows.\n")
+```
+
+# 5) Resolution covariates (height & area)
+
+```{r resolution, message=FALSE, warning=FALSE}
+# Prefer the filtered dataset
+df <- dat_final
+
+# Combined resolution field (very permissive)
+res_combined <- names(df)[grepl("resolution", names(df), ignore.case = TRUE)][1] %||% NA_character_
+
+# Separate candidates
+res_h_col <- names(df)[grepl("(screen|browser|client|res(olution)?)\\s*.*height", names(df), ignore.case = TRUE)][1] %||% NA_character_
+res_w_col <- names(df)[grepl("(screen|browser|client|res(olution)?)\\s*.*width",  names(df), ignore.case = TRUE)][1] %||% NA_character_
+
+df$res_height <- df$res_height %||% NA_real_
+df$res_width  <- df$res_width  %||% NA_real_
+df$res_area   <- df$res_area   %||% NA_real_
+
+# Parse combined resolution like "1920x1080", "1920 x 1080", "1080 × 1920"
+if (!is.na(res_combined)) {
+  nums_list <- stringr::str_extract_all(df[[res_combined]], "[0-9]+")
+  if (length(nums_list)) {
+    first2 <- lapply(nums_list, function(v) as.numeric(v[seq_len(min(2, length(v)))]))
+    hw <- t(vapply(first2, function(v) {
+      if (length(v) < 2 || anyNA(v)) return(c(h=NA_real_, w=NA_real_))
+      c(h = min(v[1], v[2], na.rm = TRUE), w = max(v[1], v[2], na.rm = TRUE))
+    }, FUN.VALUE = c(h=NA_real_, w=NA_real_)))
+    df$res_height <- ifelse(is.na(df$res_height), hw[, "h"], df$res_height)
+    df$res_width  <- ifelse(is.na(df$res_width),  hw[, "w"], df$res_width)
+  }
+}
+
+# Separate columns if present
+if (!is.na(res_h_col)) df$res_height <- ifelse(is.na(df$res_height), suppressWarnings(as.numeric(df[[res_h_col]])), df$res_height)
+if (!is.na(res_w_col)) df$res_width  <- ifelse(is.na(df$res_width),  suppressWarnings(as.numeric(df[[res_w_col]])),  df$res_width)
+
+# Area
+df$res_area <- ifelse(is.na(df$res_area) & is.finite(df$res_height) & is.finite(df$res_width),
+                      df$res_height * df$res_width, df$res_area)
+
+dat_final <- df
+
+summary(dat_final$res_height); summary(dat_final$res_area)
+```
+
+# 6) Factors & score
+
+```{r factors-score, message=FALSE, warning=FALSE}
+# Derive/standardize factors
+if (!all(c("hierarchy","chartjunk") %in% names(dat_final))) {
+  vcol <- intersect(c("version","Version","Condition","condition"), names(dat_final))[1] %||% NA_character_
+  if (is.na(vcol)) stop("Need hierarchy/chartjunk or a version column.")
+  cj <- stringr::str_match(dat_final[[vcol]], "(High|Medium|Low)Chartjunk$")[,2]
+  dat_final$chartjunk <- factor(cj, levels = c("Low","Medium","High"), ordered = TRUE)
+  hr <- stringr::str_remove(dat_final[[vcol]], "(High|Medium|Low)Chartjunk$")
+  dat_final$hierarchy <- dplyr::recode(hr,
+    "NoHierarchy" = "NoHierarchy",
+    "FloorplanHierarchy" = "FloorplanHierarchy",
+    "RoomHierarchy" = "RoomHierarchy",
+    "ImportanceHierarchy" = "ImportanceHierarchy",
+    .default = NA_character_
+  )
+} else {
+  dat_final$chartjunk <- factor(dat_final$chartjunk, levels = c("Low","Medium","High"), ordered = TRUE)
+  dat_final$hierarchy <- factor(dat_final$hierarchy)
+}
+
+# Score: prefer Score/Total_Score; else sum SCn
+score_candidates <- c("Score","Total_Score","TotalScore","score")
+have <- intersect(score_candidates, names(dat_final))
+if (length(have)) {
+  dat_final$score <- suppressWarnings(as.numeric(dat_final[[have[1]]]))
+} else {
+  sc_cols <- grep("^SC\\d+$", names(dat_final), value = TRUE)
+  if (length(sc_cols)) {
+    dat_final[sc_cols] <- lapply(dat_final[sc_cols], function(x) suppressWarnings(as.numeric(x)))
+    dat_final$score <- rowSums(dat_final[sc_cols], na.rm = TRUE)
+  } else {
+    stop("No score column found (Score/Total_Score or SCn).")
+  }
+}
+
+datA <- dat_final %>%
+  filter(is.finite(score), !is.na(hierarchy), !is.na(chartjunk)) %>%
+  droplevels()
+
+datA <- datA %>%
+  mutate(
+    hierarchy = factor(hierarchy),                           # nominal
+    chartjunk = factor(chartjunk, levels = c("Low","Medium","High"), ordered = TRUE)
+  ) %>%
+  droplevels()
+
+
+summary(datA$hierarchy); summary(datA$chartjunk)
+```
+
+# 7) ANOVA (hierarchy × chartjunk) + sjPlot visuals
+
+```{r anova, message=FALSE, warning=FALSE, fig.width=7, fig.height=4}
+m_anova <- lm(score ~ hierarchy * chartjunk, data = datA)
+
+# Table & interaction plot
+sjPlot::tab_model(m_anova, show.std = TRUE, show.aic = TRUE, dv.labels = "Score")
+sjPlot::plot_model(m_anova, type = "int", terms = c("hierarchy", "chartjunk"))
+
+# Main effects
+sjPlot::plot_model(m_anova, type = "pred", terms = "hierarchy")
+sjPlot::plot_model(m_anova, type = "pred", terms = "chartjunk")
+
+# Effect sizes
+car::Anova(m_anova, type = 2)
+effectsize::eta_squared(m_anova, partial = TRUE)
+```
+
+# 8) ANCOVA(s) with resolution
+
+```{r ancova, message=FALSE, warning=FALSE, fig.width=7, fig.height=4}
+# ==== ANCOVA(s) with resolution (robust to sjPlot naming bug) ====
+
+# Build models list
+models <- list()
+if ("res_height" %in% names(datA) && any(is.finite(datA$res_height))) {
+  models[["Height"]] <- lm(score ~ hierarchy * chartjunk + res_height, data = datA)
+}
+if ("res_area" %in% names(datA) && any(is.finite(datA$res_area))) {
+  models[["Area"]]   <- lm(score ~ hierarchy * chartjunk + res_area,   data = datA)
+}
+
+if (length(models) > 0) {
+  for (nm in names(models)) {
+    m <- models[[nm]]
+    cat("\n## ANCOVA with", nm, "covariate\n")
+    # sjPlot table
+    print(sjPlot::tab_model(m, show.std = TRUE, show.aic = TRUE,
+                            dv.labels = paste0("Score (", nm, ")")))
+    # Interaction and main-effect plots
+    print(sjPlot::plot_model(m, type = "int",  terms = c("hierarchy", "chartjunk")))
+    print(sjPlot::plot_model(m, type = "pred", terms = "hierarchy"))
+    print(sjPlot::plot_model(m, type = "pred", terms = "chartjunk"))
+    # Optional: Type-III partial eta^2
+    print(effectsize::eta_squared(car::Anova(m, type = 3), partial = TRUE))
+  }
+} else {
+  message("No usable resolution covariate found; ANCOVA skipped.")
+}
+
+
+```
+
+# 8.5) ANCOVA with prior usage
+
+```{r}
+# ---- Libraries & tiny helper --------------------------------------------------
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(dplyr, stringr, emmeans, broom, tidyr)
+
+`%||%` <- function(a,b) if (is.null(a) || length(a)==0 || all(is.na(a))) b else a
+
+# ---- 0) REQUIRE: dat_final exists --------------------------------------------
+stopifnot(exists("dat_final"), is.data.frame(dat_final))
+
+# ---- 1) Derive/standardize factors (your original logic) ---------------------
+if (!all(c("hierarchy","chartjunk") %in% names(dat_final))) {
+  vcol <- intersect(c("version","Version","Condition","condition"), names(dat_final))[1] %||% NA_character_
+  if (is.na(vcol)) stop("Need hierarchy/chartjunk or a version column.")
+  cj <- stringr::str_match(dat_final[[vcol]], "(High|Medium|Low)Chartjunk$")[,2]
+  dat_final$chartjunk <- factor(cj, levels = c("Low","Medium","High"), ordered = TRUE)
+  hr <- stringr::str_remove(dat_final[[vcol]], "(High|Medium|Low)Chartjunk$")
+  dat_final$hierarchy <- dplyr::recode(hr,
+    "NoHierarchy" = "NoHierarchy",
+    "FloorplanHierarchy" = "FloorplanHierarchy",
+    "RoomHierarchy" = "RoomHierarchy",
+    "ImportanceHierarchy" = "ImportanceHierarchy",
+    .default = NA_character_
+  )
+} else {
+  dat_final$chartjunk <- factor(dat_final$chartjunk, levels = c("Low","Medium","High"), ordered = TRUE)
+  dat_final$hierarchy <- factor(dat_final$hierarchy)
+}
+
+# ---- 2) Locate core columns (score, resolution, prior-use) -------------------
+# score column (try common candidates)
+score_col <- intersect(c("score","Score","total_score","TotalScore","Total_Score"), names(dat_final))[1] %||% NA_character_
+if (is.na(score_col)) stop("Need a score column; tried: score / total_score variants.")
+
+# resolution area: prefer res_area; else compute from width*height if present; else best guess
+if (!"res_area" %in% names(dat_final)) {
+  if (all(c("res_width","res_height") %in% names(dat_final))) {
+    dat_final$res_area <- suppressWarnings(as.numeric(dat_final$res_width) * as.numeric(dat_final$res_height))
+  } else {
+    cand_area <- grep("area|resolution_area|pixel.*area", names(dat_final), ignore.case = TRUE, value = TRUE)
+    if (length(cand_area)) dat_final$res_area <- suppressWarnings(as.numeric(dat_final[[cand_area[1]]]))
+  }
+}
+if (!"res_area" %in% names(dat_final)) stop("Couldn't find or create res_area.")
+
+# smart-home prior use column (exact long header or fuzzy match)
+sh_col <- names(dat_final)[grepl("smart\\s*home.*dashboard", names(dat_final), ignore.case = TRUE)][1] %||%
+          names(dat_final)[grepl("smart\\s*home.*use", names(dat_final), ignore.case = TRUE)][1] %||% NA_character_
+if (is.na(sh_col)) stop("Can't find the smart-home prior-use column (looked for 'smart home ... dashboard').")
+
+# ---- 3) Build analysis frame --------------------------------------------------
+A <- dat_final %>%
+  mutate(
+    score = as.numeric(.data[[score_col]]),
+    prior_sh_any = ifelse(.data[[sh_col]] %in% c("Monthly","Weekly","Daily"), 1L, 0L),
+    res_area = as.numeric(res_area),
+    res_area_z = as.numeric(scale(res_area))
+  ) %>%
+  filter(!is.na(score), !is.na(hierarchy), !is.na(chartjunk),
+         !is.na(res_area_z), !is.na(prior_sh_any))
+
+# Quick sanity prints
+cat("\nCounts by chartjunk x prior_sh_any:\n")
+print(A %>% count(chartjunk, prior_sh_any) %>% tidyr::complete(chartjunk, prior_sh_any, fill = list(n = 0)))
+cat("\nProportion with ANY smart-home prior use:\n")
+print(prop.table(table(A$prior_sh_any)))
+
+# ---- 4) Models: base ANCOVA vs + prior use -----------------------------------
+m_base  <- lm(score ~ hierarchy*chartjunk + res_area_z, data = A)
+m_prior <- lm(score ~ hierarchy*chartjunk + res_area_z + prior_sh_any, data = A)
+
+cat("\nDoes prior_sh_any improve fit?\n")
+print(anova(m_base, m_prior))
+
+# ---- 5) EMMs & contrasts (hold covariates at their means) --------------------
+emm_base  <- emmeans(m_base,  ~ chartjunk, cov.reduce = mean)
+emm_prior <- emmeans(m_prior, ~ chartjunk, cov.reduce = mean)
+
+HM_base  <- contrast(emm_base,  list(HminusM = c(0,-1,1))) %>% summary(infer = TRUE)
+HM_prior <- contrast(emm_prior, list(HminusM = c(0,-1,1))) %>% summary(infer = TRUE)
+
+poly_base  <- contrast(emm_base,  "poly") %>% summary(infer = TRUE)
+poly_prior <- contrast(emm_prior, "poly") %>% summary(infer = TRUE)
+
+cat("\nAdjusted means (no prior):\n"); print(emm_base)
+cat("\nAdjusted means (+ prior):\n"); print(emm_prior)
+
+cat("\nHigh − Medium contrast (no prior):\n"); print(HM_base)
+cat("\nHigh − Medium contrast (+ prior):\n"); print(HM_prior)
+
+cat("\nPolynomial trend on chartjunk (no prior):\n"); print(poly_base)
+cat("\nPolynomial trend on chartjunk (+ prior):\n"); print(poly_prior)
+
+# ---- 6) (Optional) Show sample-change effect with matched-rows ANOVA ---------
+m_anova_matched <- lm(score ~ hierarchy*chartjunk, data = A)
+emm_anova_m <- emmeans(m_anova_matched, ~ chartjunk)
+HM_anova_m  <- contrast(emm_anova_m, list(HminusM = c(0,-1,1))) %>% summary(infer = TRUE)
+
+cat("\nMatched-rows ANOVA (no covariates) — High − Medium:\n")
+print(HM_anova_m)
+
+
+```
+
+
+# 9) Ordinal trend test for chartjunk (optional)
+
+```{r chartjunk-trend, message=FALSE}
+emms <- emmeans::emmeans(m_anova, ~ chartjunk)
+emmeans::contrast(emms, method = "poly")
+```
+
+# 10) Power block
+
+```{r}
+# ===== POWER FROM PILOT (Type III + linear trend for chartjunk) =====
+
+# 0) Use your cleaned pilot
+dat_pilot <- datA
+
+# 1) Ensure factors and desired order
+dat_pilot$chartjunk <- factor(dat_pilot$chartjunk,
+                              levels = c("Low","Medium","High"),
+                              ordered = TRUE)
+dat_pilot$hierarchy <- factor(dat_pilot$hierarchy)
+
+alpha         <- 0.025
+target_power  <- 0.80
+shrink        <- 0.80      # mild optimism guard
+SESOI_d       <- 0.40      # two-level SESOI; for omnibus, f ≈ d/2 ⇒ 0.20
+SESOI_f       <- 0.20
+
+# --- Type III setup for reporting (analytical power doesn't depend on this) ---
+old_contr <- options("contrasts")
+options(contrasts = c("contr.sum","contr.poly"))
+
+fit_add <- lm(score ~ chartjunk + hierarchy, data = dat_pilot)   # additive model
+sigma_hat <- sigma(fit_add)
+k_vec <- c(nlevels(dat_pilot$chartjunk), nlevels(dat_pilot$hierarchy))  # 3,4
+df2_pilot <- nrow(dat_pilot) - (1 + sum(k_vec - 1))  # residual df in additive model
+
+# Quick reportable table if you need it:
+# car::Anova(fit_add, type = 3)
+
+# ---------------- Helpers ----------------
+marginal_means_ns <- function(dat, dv, fac){
+  mm <- aggregate(dat[[dv]], list(dat[[fac]]), mean)
+  ns <- aggregate(dat[[dv]], list(dat[[fac]]), length)
+  lv <- as.character(mm[[1]])
+  list(levels=lv,
+       means=setNames(mm[[2]], lv),
+       n=setNames(ns[[2]], lv),
+       props=setNames(ns[[2]]/sum(ns[[2]]), lv))
+}
+
+# Weighted (unequal-n) omnibus ANOVA f^2 for a k-level factor
+f2_weighted_from_means <- function(means, props, sigma){
+  mu <- sum(props * means)
+  sum(props * (means - mu)^2) / sigma^2
+}
+
+# 1-df linear-contrast power with unequal n
+power_linear_contrast_givenN <- function(deltaL, c, n_vec, df2, alpha){
+  se_factor <- sqrt(sum((c^2)/n_vec))     # SE / sigma
+  ncp <- (deltaL / se_factor)^2
+  Fc <- qf(1 - alpha, 1, df2)
+  1 - pf(Fc, 1, df2, ncp = ncp)
+}
+
+# Two root-finders for N
+solve_N_linear_trend <- function(deltaL, prop_vec, c, alpha, target_power, k_vec, N_max=5000){
+  prop_vec <- prop_vec/sum(prop_vec)
+  f_needed <- function(N){
+    N <- ceiling(N)
+    n_vec <- pmax(2, floor(N * prop_vec))
+    df2 <- N - (1 + sum(k_vec - 1))
+    if (df2 <= 1) return(-target_power)
+    power_linear_contrast_givenN(deltaL, c, n_vec, df2, alpha) - target_power
+  }
+  ceiling(uniroot(f_needed, c(10, N_max))$root)
+}
+
+solve_N_anova_omnibus <- function(f2_weighted, df1, alpha, target_power, k_vec, N_max=5000){
+  f_needed <- function(N){
+    N <- ceiling(N)
+    df2 <- N - (1 + sum(k_vec - 1))
+    if (df2 <= df1 + 1) return(-target_power)
+    ncp <- N * f2_weighted  # λ = N * f_w^2 with weighted f
+    Fc <- qf(1 - alpha, df1, df2)
+    (1 - pf(Fc, df1, df2, ncp = ncp)) - target_power
+  }
+  ceiling(uniroot(f_needed, c(10, N_max))$root)
+}
+
+# ---------------- Chartjunk: linear trend (−1,0,+1) ----------------
+cj <- marginal_means_ns(dat_pilot, "score", "chartjunk")
+cj_means <- cj$means[c("Low","Medium","High")]
+cj_props <- cj$props[c("Low","Medium","High")]
+c_lin <- c(-1, 0, +1)
+
+# Standardized linear contrast from pilot (delta_L = sum(c_i * mean_i) / sigma)
+deltaL_hat  <- sum(c_lin * cj_means) / sigma_hat
+
+# Plan to detect at least SESOI d=.40; for −1,0,+1 contrast, |deltaL| == |d(Low vs High)|
+deltaL_plan <- max(SESOI_d, shrink * abs(deltaL_hat)) * sign(ifelse(deltaL_hat==0, 1, deltaL_hat))
+
+# Power at pilot N (using actual cell sizes)
+pwr_cj_pilot <- power_linear_contrast_givenN(
+  deltaL = deltaL_plan,
+  c      = c_lin,
+  n_vec  = cj$n[c("Low","Medium","High")],
+  df2    = df2_pilot,
+  alpha  = alpha
+)
+
+# Solve N for 80% power at α=.025, preserving pilot proportions
+N_cj <- solve_N_linear_trend(
+  deltaL       = deltaL_plan,
+  prop_vec     = as.numeric(cj_props),
+  c            = c_lin,
+  alpha        = alpha,
+  target_power = target_power,
+  k_vec        = k_vec
+)
+
+# ---------------- Hierarchy: omnibus main effect (k=4) ----------------
+hi <- marginal_means_ns(dat_pilot, "score", "hierarchy")
+f2_hat <- f2_weighted_from_means(hi$means, hi$props, sigma_hat)
+f_hat  <- sqrt(f2_hat)
+f_plan <- max(SESOI_f, shrink * f_hat)
+f2_plan <- f_plan^2
+df1_hi <- length(hi$levels) - 1
+
+# Power at pilot N for hierarchy omnibus
+Fc_hi <- qf(1 - alpha, df1_hi, df2_pilot)
+pwr_hi_pilot <- 1 - pf(Fc_hi, df1_hi, df2_pilot, ncp = nrow(dat_pilot) * f2_plan)
+
+# Solve N for hierarchy omnibus
+N_hi <- solve_N_anova_omnibus(
+  f2_weighted  = f2_plan,
+  df1          = df1_hi,
+  alpha        = alpha,
+  target_power = target_power,
+  k_vec        = k_vec
+)
+
+# ---------------- Summary ----------------
+N_required <- max(N_cj, N_hi)
+N_recommended <- ceiling(N_required * 1.12)  # +12% buffer
+
+out <- list(
+  RMSE = sigma_hat,
+  chartjunk = list(
+    means   = cj_means, props = cj_props,
+    deltaL_hat = unname(deltaL_hat),
+    deltaL_plan = unname(deltaL_plan),
+    power_at_pilotN = unname(round(pwr_cj_pilot, 3)),
+    N_target = N_cj
+  ),
+  hierarchy = list(
+    means = hi$means, props = hi$props,
+    f_hat = round(f_hat, 3),
+    f_plan = round(f_plan, 3),
+    power_at_pilotN = unname(round(pwr_hi_pilot, 3)),
+    N_target = N_hi
+  ),
+  N_required_max = N_required,
+  N_recommended_with_12pct_buffer = N_recommended
+)
+print(out, max.levels = 2)
+
+# restore contrasts
+options(contrasts = old_contr$contrasts)
+
+```
+
+# Item response stuff
+
+```{r}
+# ---- Per-item accuracy (Q1–Q20): hardcoded key + charts ----
+stopifnot(exists("datA"))
+
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(dplyr, tidyr, stringr, tibble, ggplot2, forcats, readr, scales)
+
+# Be forgiving about whitespace/case
+normalize_label <- function(x) {
+  x %>%
+    as.character() %>%
+    stringr::str_replace_all("&amp;", "&") %>%
+    stringr::str_replace_all("&apos;|&#39;", "'") %>%
+    stringr::str_replace_all("&quot;", "\"") %>%
+    stringr::str_squish() %>%
+    stringr::str_to_lower()
+}
+
+# Map Q1..Q20 to the actual response columns in datA
+# --- replace the old pick_col_for_q() with this ---
+pick_col_for_q <- function(i, nm) {
+  # all candidates that look like this question
+  cand <- grep(paste0("^q", i, "(\\b|_)"), nm, ignore.case = TRUE, value = TRUE)
+  if (!length(cand)) return(NA_character_)
+
+  # toss known paradata / helper fields
+  bad_re <- "(first.?click|last.?click|click|time|duration|page.?submit|display.?order|random|seen|group|_text$|text$)"
+  cand <- cand[!grepl(bad_re, cand, ignore.case = TRUE)]
+
+  # prefer the 'plainest' column name (usually the actual response)
+  cand <- cand[order(nchar(cand))]
+  cand[1] %||% NA_character_
+}
+
+
+q_map <- tibble(
+  qid = paste0("Q", 1:20),
+  col = vapply(1:20, function(i) pick_col_for_q(i, names(datA)), character(1))
+) %>% filter(!is.na(col))
+
+print(q_map)  # sanity check: these should look like the response columns, not click/time/etc.
+
+
+if (!nrow(q_map)) stop("Couldn't find any Q1..Q20 response columns in datA. Check names(datA).")
+
+# Hardcoded key from your screenshot
+answer_key <- tibble::tribble(
+  ~qid,  ~correct_display,
+  "Q1",  "Leak detector",
+  "Q2",  "Bathroom",
+  "Q3",  "Kitchen",
+  "Q4",  "Bathroom",
+  "Q5",  "Office",
+  "Q6",  "Bathroom",
+  "Q7",  "Entrance",
+  "Q8",  "Kitchen",
+  "Q9",  "East",
+  "Q10", "3",
+  "Q11", "4",
+  "Q12", "Bathroom and Kitchen",
+  "Q13", "Bedroom",
+  "Q14", "2",
+  "Q15", "Kitchen and Living room each had exactly one issue.",
+  "Q16", "Evenly spread",
+  "Q17", "0",
+  "Q18", "Mirror 1 and Mirror 2",
+  "Q19", "Bathroom",
+  "Q20", "Smart home"
+)
+
+# Tidy + score
+long <- datA %>%
+  dplyr::select(hierarchy, dplyr::all_of(q_map$col)) %>%
+  tidyr::pivot_longer(dplyr::all_of(q_map$col), names_to = "col", values_to = "resp") %>%
+  dplyr::left_join(q_map, by = "col") %>%
+  dplyr::left_join(answer_key, by = "qid") %>%
+  dplyr::mutate(
+    resp_norm = normalize_label(resp),
+    key_norm  = normalize_label(correct_display),
+    correct   = dplyr::if_else(!is.na(resp_norm) & !is.na(key_norm) & resp_norm == key_norm, 1, 0, missing = NA_real_)
+  )
+
+# Summaries
+overall <- long %>%
+  dplyr::group_by(qid) %>%
+  dplyr::summarise(pct_correct = mean(correct, na.rm = TRUE),
+                   n = sum(!is.na(correct)), .groups = "drop") %>%
+  dplyr::filter(is.finite(pct_correct)) %>%
+  dplyr::mutate(qid = forcats::fct_relevel(qid, paste0("Q", 1:20)))
+
+by_hier <- long %>%
+  dplyr::filter(!is.na(hierarchy)) %>%
+  dplyr::group_by(hierarchy, qid) %>%
+  dplyr::summarise(pct_correct = mean(correct, na.rm = TRUE),
+                   n = sum(!is.na(correct)), .groups = "drop") %>%
+  dplyr::mutate(qid = factor(qid, levels = levels(overall$qid)))
+
+delta <- by_hier %>%
+  dplyr::left_join(overall %>% dplyr::select(qid, overall = pct_correct), by = "qid") %>%
+  dplyr::mutate(delta = pct_correct - overall)
+
+# Plots
+p_overall <- ggplot(overall, aes(qid, pct_correct)) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = scales::percent(pct_correct, accuracy = 1)), vjust = -0.25, size = 3) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Per-question accuracy (overall)", x = "Question", y = "% correct") +
+  theme_minimal()
+print(p_overall)
+
+p_small <- ggplot(by_hier, aes(qid, pct_correct)) +
+  geom_col(width = 0.75) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Per-question accuracy by hierarchy", x = "Question", y = "% correct") +
+  facet_wrap(~ hierarchy, nrow = 2) +
+  theme_minimal()
+print(p_small)
+
+p_delta <- ggplot(delta, aes(qid, delta)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_col(width = 0.75) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Discrepancies by hierarchy (Δ vs overall)", x = "Question", y = "Δ % correct") +
+  facet_wrap(~ hierarchy, nrow = 2) +
+  theme_minimal()
+print(p_delta)
+
+
+```
+
+```{r}
+# ---- Per-item accuracy (map exact question-text cols -> Q1..Q20, then score) ----
+stopifnot(exists("datA"))
+
+if (!requireNamespace("pacman", quietly=TRUE)) install.packages("pacman")
+pacman::p_load(dplyr, tidyr, tibble, stringr, ggplot2, forcats, scales)
+
+normalize_label <- function(x) {
+  x |> as.character() |> str_squish() |> str_to_lower()
+}
+
+# 1) Your exact column names (from your message). Note the mojibake quotes on Q17.
+col_map <- c(
+  Q1  = "Which device had the worst problem?",
+  Q2  = "Which room had a mirror?",
+  Q3  = "Which room contained an appliance?",
+  Q4  = "Which room had two lights switched off (not alerts)?",
+  Q5  = "Which room had no devices?",
+  Q6  = "Which room had the leak?",
+  Q7  = "Which room had the smoke detector?",
+  Q8  = "Which room had half of the lights offline?",
+  Q9  = "Which direction was the offline ceiling light?",
+  Q10 = "How many items were Warnings (non-critical alerts)?",
+  Q11 = "How many rooms had at least one issue (critical or warning)?",
+  Q12 = "Which pair of rooms both had at least one issue?",
+  Q13 = "Which of these rooms had no issues at all?",
+  Q14 = "How many devices were specifically labeled as Offline (not just Off)?",
+  Q15 = "Which statement is true?",
+  Q16 = "Where were issues most concentrated?",
+  Q17 = "How many devices named â€œSinkâ€ were shown?",
+  Q18 = "Which two devices were both Off but not alerts?",
+  Q19 = "Which room contained two devices that were Off (but not alerts)?",
+  Q20 = "What type of dashboard did you see?"
+)
+
+# 1a) If Q17 still doesn't match (encoding weirdness), auto-detect by regex
+if (!col_map["Q17"] %in% names(datA)) {
+  cand <- names(datA)[stringr::str_detect(
+    names(datA),
+    stringr::regex("^How\\s+many\\s+devices\\s+named.*sink.*shown\\?$", ignore_case = TRUE)
+  )]
+  if (length(cand)) {
+    col_map["Q17"] <- cand[1]
+    message("Mapped Q17 to detected column: ", col_map["Q17"])
+  } else {
+    stop("Couldn't locate Q17 ('How many devices named “Sink” were shown?') in names(datA).")
+  }
+}
+
+# sanity: warn if any are missing from datA
+missing_cols <- setdiff(unname(col_map), names(datA))
+if (length(missing_cols)) {
+  message("These expected columns weren't found (check Q17 quotes?): ",
+          paste(missing_cols, collapse = " | "))
+}
+
+# 2) Make a clean wide df with columns Q1..Q20 (no display-order sidecars)
+target_cols <- unname(col_map)  # the exact question-text columns, in order
+resp_wide <- datA %>%
+  dplyr::select(hierarchy, dplyr::all_of(target_cols))
+
+# Rename by position: hierarchy stays "hierarchy", the rest become Q1..Q20
+names(resp_wide) <- c("hierarchy", names(col_map))
+
+# sanity peek
+print(colnames(resp_wide))
+
+
+# 3) Hardcoded key from your screenshot
+answer_key <- tibble::tribble(
+  ~qid,  ~correct_display,
+  "Q1",  "Leak detector",
+  "Q2",  "Bathroom",
+  "Q3",  "Kitchen",
+  "Q4",  "Bathroom",
+  "Q5",  "Office",
+  "Q6",  "Bathroom",
+  "Q7",  "Entrance",
+  "Q8",  "Kitchen",
+  "Q9",  "East",
+  "Q10", "3",
+  "Q11", "4",
+  "Q12", "Bathroom and Kitchen",
+  "Q13", "Bedroom",
+  "Q14", "2",
+  "Q15", "Kitchen and Living room each had exactly one issue.",
+  "Q16", "Evenly spread",
+  "Q17", "0",
+  "Q18", "Mirror 1 and Mirror 2",
+  "Q19", "Bathroom",
+  "Q20", "Smart home"
+)
+
+# 4) Long + score (now pivoting simple Q1..Q20 names)
+long <- resp_wide |>
+  tidyr::pivot_longer(dplyr::starts_with("Q"), names_to = "qid", values_to = "resp") |>
+  dplyr::left_join(answer_key, by = "qid") |>
+  dplyr::mutate(
+    resp_norm = normalize_label(resp),
+    key_norm  = normalize_label(correct_display),
+    correct   = dplyr::if_else(!is.na(resp_norm) & !is.na(key_norm) & resp_norm == key_norm,
+                               1, 0, missing = NA_real_)
+  )
+
+# 5) Summaries
+overall <- long |>
+  dplyr::group_by(qid) |>
+  dplyr::summarise(pct_correct = mean(correct, na.rm = TRUE),
+                   n = sum(!is.na(correct)), .groups = "drop") |>
+  dplyr::mutate(qid = forcats::fct_relevel(qid, paste0("Q", 1:20)))
+
+by_hier <- long |>
+  dplyr::filter(!is.na(hierarchy)) |>
+  dplyr::group_by(hierarchy, qid) |>
+  dplyr::summarise(pct_correct = mean(correct, na.rm = TRUE),
+                   n = sum(!is.na(correct)), .groups = "drop") |>
+  dplyr::mutate(qid = factor(qid, levels = levels(overall$qid)))
+
+delta <- by_hier |>
+  dplyr::left_join(overall |>
+                     dplyr::select(qid, overall = pct_correct), by = "qid") |>
+  dplyr::mutate(delta = pct_correct - overall)
+
+# 6) Plots
+p_overall <- ggplot(overall, aes(qid, pct_correct)) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = scales::percent(pct_correct, accuracy = 1)),
+            vjust = -0.25, size = 3) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Per-question accuracy (overall)", x = "Question", y = "% correct") +
+  theme_minimal()
+print(p_overall)
+
+p_small <- ggplot(by_hier, aes(qid, pct_correct)) +
+  geom_col(width = 0.75) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Per-question accuracy by hierarchy", x = "Question", y = "% correct") +
+  facet_wrap(~ hierarchy, nrow = 2) +
+  theme_minimal()
+print(p_small)
+
+p_delta <- ggplot(delta, aes(qid, delta)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_col(width = 0.75) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Discrepancies by hierarchy (Δ vs overall)", x = "Question", y = "Δ % correct") +
+  facet_wrap(~ hierarchy, nrow = 2) +
+  theme_minimal()
+print(p_delta)
+
+# 7) Quick diag (optional)
+diag <- long |>
+  dplyr::group_by(qid) |>
+  dplyr::summarise(
+    sample_values = paste(head(unique(as.character(resp)), 5), collapse = " | "),
+    key = first(correct_display)
+  )
+print(diag, n = 20)
+
+
+```
+
