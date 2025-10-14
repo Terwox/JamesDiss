@@ -1,6 +1,7 @@
 ---
 title: "Study 2 — Wave4+ Clean Pipeline (Attention + Hardcoded Longstring)"
 output:
+  pdf_document: default
   html_document:
     df_print: paged
 editor_options:
@@ -504,6 +505,183 @@ contrast(emm_cj, "poly")   # check the "Linear" row
 # linear trend within each hierarchy
 emm_cj_h <- emmeans(m_aov, ~ chartjunk | hierarchy, weights = "equal")
 contrast(emm_cj_h, "poly") # Linear per hierarchy level
+
+```
+
+```{r}
+# ---- linear contrast at a fixed hierarchy level -----------------------------
+# deps
+library(emmeans)
+library(ggplot2)
+library(sjPlot)  # for theme_sjplot()
+
+plot_linear_contrast_at <- function(
+  m,
+  focal,                     # character: the factor you want the linear contrast on (e.g., "cond")
+  moderator = "hierarchy",   # character: the factor to hold constant
+  at_level = NULL,           # which level of moderator to hold fixed (e.g., "Manager")
+  contrast = c("poly","custom"),  # "poly" for polynomial linear trend, or "custom"
+  custom_weights = NULL,     # numeric vector if contrast = "custom" (length = #levels of focal)
+  type = "response",         # EMM scale: "response" often nicer for GLMs
+  emm_weights = "equal"      # how to average over other factors if present; "equal" is common
+) {
+  contrast <- match.arg(contrast)
+
+  # discover default at_level if not provided
+  mf <- tryCatch(model.frame(m), error = function(e) NULL)
+  if (is.null(at_level)) {
+    if (!is.null(mf) && moderator %in% names(mf) && is.factor(mf[[moderator]])) {
+      at_level <- levels(mf[[moderator]])[1]
+    } else {
+      stop("Please provide 'at_level' (couldn't infer a factor level for ", moderator, ").")
+    }
+  }
+
+  # build a reference grid with hierarchy held constant
+  rg <- ref_grid(m, at = setNames(list(at_level), moderator), type = type)
+
+  # EMMs for the focal factor at that hierarchy level
+  emm <- emmeans(rg, as.formula(paste0("~ ", focal)), weights = emm_weights)
+
+  # Linear contrast
+  lin <- if (contrast == "poly") {
+    # "poly" gives linear, quadratic, ...; take the linear component only
+    contrast(emm, "poly")["linear"]
+  } else {
+    # custom weights you define in the order of levels(emm)
+    if (is.null(custom_weights))
+      stop("Provide 'custom_weights' when contrast = 'custom'.")
+    if (length(custom_weights) != nrow(as.data.frame(emm)))
+      stop("Length of 'custom_weights' must equal the number of levels in '", focal, "'.")
+    contrast(emm, list(linear = custom_weights))
+  }
+
+  lin_sum <- summary(lin, infer = TRUE)
+  tval <- lin_sum$t.ratio
+  pval <- lin_sum$p.value
+
+  # data frame for plotting
+  emm_df <- as.data.frame(emm)
+  emm_df$.xnum <- as.numeric(emm_df[[focal]])
+
+  p <- ggplot(emm_df,
+              aes(x = .xnum,
+                  y = emmean,
+                  ymin = lower.CL, ymax = upper.CL)) +
+    geom_point(size = 3) +
+    geom_line(group = 1) +
+    geom_errorbar(width = 0.1) +
+    geom_smooth(method = "lm", se = FALSE) +
+    scale_x_continuous(breaks = emm_df$.xnum,
+                       labels = emm_df[[focal]]) +
+    labs(
+      x = focal,
+      y = paste("Estimated marginal mean (", type, " scale)", sep = ""),
+      title = paste0("Linear contrast across ", focal,
+                     " (", moderator, " = ", at_level, ")"),
+      subtitle = paste0("t = ", round(tval, 2),
+                        ", p = ", format.pval(pval, digits = 3, eps = 1e-4))
+    ) +
+    theme_sjplot()
+
+  list(plot = p, emm = emm, linear_contrast = lin)
+}
+# -----------------------------------------------------------------------------
+
+# EXAMPLE USAGE:
+# pacman::p_load(lme4)
+# m <- lmer(y ~ cond * hierarchy + (1|id), data = d)  # or lm()/glm()
+# out <- plot_linear_contrast_at(m, focal = "cond", moderator = "hierarchy",
+#                                at_level = "Manager", contrast = "poly",
+#                                type = "response", emm_weights = "equal")
+# out$plot
+# # summary(out$linear_contrast)  # full stats table
+
+```
+
+```{r}
+# --- Linear contrasts for chartjunk while holding hierarchy constant ----
+
+# pick which fitted model you want to use
+# (no covariate 2×3)     or     (ANCOVA with use_never)
+mod <- m_aov              # or: mod <- m_anc
+
+# how emmeans averages over other factors not shown in the formula
+# "equal" = simple average of cells; "proportional" = weighted by sample sizes
+wts <- "equal"            # or: wts <- "proportional"
+
+# Uses your existing m_aov (or m_anc), dat_final, and plot_linear_contrast_at()
+emm_cj_h <- emmeans(mod, ~ chartjunk | hierarchy, weights = wts)
+emm_df   <- as.data.frame(confint(emm_cj_h))
+emm_df$xnum <- as.numeric(emm_df$chartjunk)
+
+ggplot(emm_df, aes(x = xnum, y = emmean)) +
+  facet_wrap(~ hierarchy) +
+  geom_point(size = 2.5) +
+  geom_line(group = 1) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = .12) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_x_continuous(breaks = seq_along(levels(dat_final$chartjunk)),
+                     labels = levels(dat_final$chartjunk)) +
+  labs(x = "Chartjunk", y = "Estimated marginal mean") +
+  theme_sjplot()
+
+
+```
+```{r}
+# --- 3-point line charts for chartjunk: raw vs. adjusted ---------------------
+pacman::p_load(dplyr, ggplot2, emmeans, tibble, patchwork, sjPlot)
+
+# Ensure ordered factor
+dat_final$chartjunk <- factor(dat_final$chartjunk,
+                              levels = c("Low","Medium","High"),
+                              ordered = TRUE)
+
+# If needed, fit (you already have m_aov from above)
+if (!exists("m_aov")) {
+  m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
+}
+
+# 1) RAW means (ignore hierarchy entirely)
+raw_df <- dat_final %>%
+  group_by(chartjunk) %>%
+  summarize(
+    n = sum(!is.na(score)),
+    mean = mean(score, na.rm = TRUE),
+    sd = sd(score, na.rm = TRUE),
+    se = sd / sqrt(n),
+    tcrit = qt(.975, df = pmax(n - 1, 1)),
+    lower = mean - tcrit * se,
+    upper = mean + tcrit * se,
+    .groups = "drop"
+  )
+
+p_raw <- ggplot(raw_df, aes(x = chartjunk, y = mean, group = 1)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = .12) +
+  labs(x = "Chartjunk", y = "Score", title = "Raw means (ignoring hierarchy)") +
+  theme_sjplot()
+
+# 2) ADJUSTED means (EMMs) for chartjunk, balanced over hierarchy
+emm_cj_eq <- emmeans(m_aov, ~ chartjunk, weights = "equal")
+emm_df <- as.data.frame(confint(emm_cj_eq))
+
+p_adj <- ggplot(emm_df, aes(x = chartjunk, y = emmean, group = 1)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = .12) +
+  labs(x = "Chartjunk", y = "Estimated marginal mean",
+       title = "EMMs balanced over hierarchy") +
+  theme_sjplot()
+
+# Show side by side
+p_raw | p_adj
+# ------------------------------------------------------------------------------
+
+# If you want the adjusted version to use sample-mix instead of equal weighting:
+# emm_cj_prop <- emmeans(m_aov, ~ chartjunk, weights = "proportional")
+# as.data.frame(confint(emm_cj_prop))
 
 ```
 
