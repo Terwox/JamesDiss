@@ -1,9 +1,10 @@
 ---
 title: "Study 2 — Wave4+ Clean Pipeline (Attention + Hardcoded Longstring)"
 output:
-  pdf_document: default
   html_document:
     df_print: paged
+    code_folding: hide
+  pdf_document: default
 editor_options:
   chunk_output_type: inline
 ---
@@ -25,13 +26,14 @@ options(cli.num_colors = 1, crayon.enabled = FALSE)
 
 ```{r config}
 # ---- PATH ----
-path <- r"(D:\Dropbox\USD\Dissertation\Collab folder\Data\Dissertation+-+Study+2+-+Wave4+_October+6,+2025_15.23.csv)"
+path <- r"(C:\Users\terwo\Dropbox\USD\Dissertation\Collab folder\Data\Dissertation+-+Study+2+-+Wave4+_October+6,+2025_15.23.csv)"
 ```
 
 # 1) Packages
 
 ```{r packages}
 if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+library(pacman)
 pacman::p_load(readr, dplyr, stringr, ggplot2, broom, effectsize, careless)
 ```
 
@@ -51,16 +53,16 @@ dat <- raw0[-c(1,2), , drop = FALSE]
 # Keep finished only (exact header "Finished")
 dat <- dat %>% filter(Finished %in% c("True","true","1"))
 
-# Coerce duration and score
+# Coerce duration and Score
 dat[["Duration (in seconds)"]] <- suppressWarnings(as.numeric(dat[["Duration (in seconds)"]]))
 dat[["SC0"]]                   <- suppressWarnings(as.numeric(dat[["SC0"]]))
-dat$score <- dat[["SC0"]]
+dat$Score <- dat[["SC0"]]
 
 stopifnot(nrow(dat) > 0)
-stopifnot(!all(is.na(dat$score)))
+stopifnot(!all(is.na(dat$Score)))
 ```
 
-# 3) Derive factors (Version → hierarchy & chartjunk)
+# 3) Derive factors (Version → Hierarchy & chartjunk)
 
 ```{r factors}
 stopifnot("Version" %in% names(dat))
@@ -70,7 +72,7 @@ chart <- stringr::str_match(dat$Version, "(High|Medium|Low)Chartjunk$")[,2]
 hier  <- stringr::str_remove(dat$Version, "(High|Medium|Low)Chartjunk$")
 
 dat$chartjunk <- factor(chart, levels = c("Low","Medium","High"), ordered = TRUE)
-dat$hierarchy <- factor(
+dat$Hierarchy <- factor(
   dplyr::recode(hier,
     "NoHierarchy"         = "NoHierarchy",
     "FloorplanHierarchy"  = "FloorplanHierarchy",
@@ -79,6 +81,23 @@ dat$hierarchy <- factor(
     .default = NA_character_
   ),
   levels = c("NoHierarchy","FloorplanHierarchy","RoomHierarchy","ImportanceHierarchy")
+)
+
+## Recoding dat$Hierarchy
+dat$Hierarchy <- as.character(dat$Hierarchy)
+dat$Hierarchy[dat$Hierarchy == "NoHierarchy"] <- "None"
+dat$Hierarchy[dat$Hierarchy == "FloorplanHierarchy"] <- "Floorplan"
+dat$Hierarchy[dat$Hierarchy == "RoomHierarchy"] <- "Room"
+dat$Hierarchy[dat$Hierarchy == "ImportanceHierarchy"] <- "Importance"
+
+## Reordering dat$Hierarchy
+dat$Hierarchy <- factor(dat$Hierarchy,
+  levels = c("Importance", "None", "Room", "Floorplan")
+)
+
+## Reordering dat$Hierarchy
+dat$Hierarchy <- factor(dat$Hierarchy,
+  levels = c("Importance", "None", "Room", "Floorplan")
 )
 ```
 
@@ -254,8 +273,8 @@ cat("Longstring on First..Seventh: threshold >", round(thr, 2),
 # 8) Quick EDA (optional)
 
 ```{r eda, fig.width=7, fig.height=4}
-# Score ~ hierarchy
-ggplot(dat_final, aes(hierarchy, score)) +
+# Score ~ Hierarchy
+ggplot(dat_final, aes(Hierarchy, Score)) +
   geom_violin(trim = FALSE) +
   geom_boxplot(width = .12, outlier.shape = NA) +
   geom_jitter(width = .12, height = 0, alpha = .25, size = 1) +
@@ -263,7 +282,7 @@ ggplot(dat_final, aes(hierarchy, score)) +
   theme_minimal(base_size = 12)
 
 # Score ~ chartjunk
-ggplot(dat_final, aes(chartjunk, score)) +
+ggplot(dat_final, aes(chartjunk, Score)) +
   geom_violin(trim = FALSE) +
   geom_boxplot(width = .12, outlier.shape = NA) +
   geom_jitter(width = .12, height = 0, alpha = .25, size = 1) +
@@ -291,10 +310,10 @@ sessionInfo()
 ```{r}
 # ---- ANCOVA: adjust for dashboard use (Never vs Otherwise) ----
 suppressPackageStartupMessages({
-  library(car)
-  library(emmeans)
-  library(effectsize)
-  library(ggplot2)
+  p_load(car)
+  p_load(emmeans)
+  p_load(effectsize)
+  p_load(ggplot2)
 })
 
 # 1) Recode usage to binary factor (ref = Otherwise)
@@ -306,7 +325,7 @@ dat_final$use_never <- factor(dat_final$use_never, levels = c("Otherwise","Never
 table(dat_final$use_never, useNA = "ifany")
 
 # 2) Fit ANCOVA (binary covariate)
-m_anc <- lm(score ~ hierarchy * chartjunk + use_never, data = dat_final)
+m_anc <- lm(Score ~ Hierarchy * chartjunk + use_never, data = dat_final)
 
 # 3) Type-III tests with sum contrasts
 old_contr <- options(contrasts = c("contr.sum","contr.poly"))
@@ -318,30 +337,30 @@ anc_tests
 # 4) Effect sizes (partial eta^2)
 eta_squared(anc_tests, partial = TRUE)
 
-# 5) Adjusted means (EMMs) for hierarchy x chartjunk
+# 5) Adjusted means (EMMs) for Hierarchy x chartjunk
 #    weights = "proportional" averages over use_never by its sample proportions.
 #    If you prefer equal weighting across use_never levels, set weights = "equal".
-emm_anc <- emmeans(m_anc, ~ hierarchy * chartjunk, weights = "proportional")
+emm_anc <- emmeans(m_anc, ~ Hierarchy * chartjunk, weights = "proportional")
 confint(emm_anc)
 
 # 6) Plot adjusted means with 95% CIs
 emm_df <- as.data.frame(confint(emm_anc))
-ggplot(emm_df, aes(hierarchy, emmean, group = chartjunk, color = chartjunk)) +
+ggplot(emm_df, aes(Hierarchy, emmean, group = chartjunk, color = chartjunk)) +
   geom_line(position = position_dodge(width = .2)) +
   geom_point(position = position_dodge(width = .2), size = 2.5) +
   geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
                 width = .12, position = position_dodge(width = .2)) +
-  labs(x = "Hierarchy", y = "Adjusted mean score (ANCOVA)",
+  labs(x = "Hierarchy", y = "Adjusted mean Score (ANCOVA)",
        color = "Chartjunk") +
   theme_minimal(base_size = 12)
 
 # 7) (Optional) follow-ups
-# Pairwise simple effects of chartjunk within each hierarchy (Tukey-adjusted)
-pairs(emmeans(m_anc, ~ chartjunk | hierarchy, weights = "proportional"),
+# Pairwise simple effects of chartjunk within each Hierarchy (Tukey-adjusted)
+pairs(emmeans(m_anc, ~ chartjunk | Hierarchy, weights = "proportional"),
       adjust = "tukey")
 
-# Pairwise simple effects of hierarchy within each chartjunk
-pairs(emmeans(m_anc, ~ hierarchy | chartjunk, weights = "proportional"),
+# Pairwise simple effects of Hierarchy within each chartjunk
+pairs(emmeans(m_anc, ~ Hierarchy | chartjunk, weights = "proportional"),
       adjust = "tukey")
 
 # 8) (Optional) model diagnostics
@@ -360,13 +379,13 @@ pacman::p_load(sjPlot, sjlabelled)
 theme_set(sjPlot::theme_sjplot())
 options(cli.num_colors = 1, crayon.enabled = FALSE)
 
-# 1) Interaction: hierarchy × chartjunk (averages over use_never by sample mix)
+# 1) Interaction: Hierarchy × chartjunk (averages over use_never by sample mix)
 p_int <- sjPlot::plot_model(
   m_anc,
   type  = "int",
-  terms = c("hierarchy", "chartjunk"),   # x, group
+  terms = c("Hierarchy", "chartjunk"),   # x, group
   ci.lvl = 0.95
-) + labs(x = "Hierarchy", y = "Adjusted mean score") +
+) + labs(x = "Hierarchy", y = "Adjusted mean Score") +
     guides(linetype = "none", shape = "none")
 p_int
 
@@ -375,8 +394,8 @@ p_int
 p_pred <- sjPlot::plot_model(
   m_anc,
   type  = "pred",
-  terms = c("hierarchy", "chartjunk", "use_never")
-) + labs(x = "Hierarchy", y = "Adjusted mean score", color = "Chartjunk") +
+  terms = c("Hierarchy", "chartjunk", "use_never")
+) + labs(x = "Hierarchy", y = "Adjusted mean Score", color = "Chartjunk") +
     guides(linetype = "none", shape = "none")
 p_pred
 
@@ -403,13 +422,13 @@ sjPlot::tab_model(
 ```
 
 ```{r}
-m_mod <- lm(score ~ hierarchy * chartjunk * use_never, data = dat_final)
+m_mod <- lm(Score ~ Hierarchy * chartjunk * use_never, data = dat_final)
 car::Anova(m_mod, type = 3)
 
 ```
 ```{r}
-m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
-m_anc <- lm(score ~ hierarchy * chartjunk + use_never, data = dat_final)
+m_aov <- lm(Score ~ Hierarchy * chartjunk, data = dat_final)
+m_anc <- lm(Score ~ Hierarchy * chartjunk + use_never, data = dat_final)
 
 anova(m_aov, m_anc)   # nested F-test
 AIC(m_aov, m_anc); BIC(m_aov, m_anc)
@@ -417,9 +436,9 @@ AIC(m_aov, m_anc); BIC(m_aov, m_anc)
 ```
 ```{r}
 # --- Final 2×3 ANOVA (no covariate) ---
-library(car); library(emmeans); library(effectsize); library(sjPlot)
+p_load(car); p_load(emmeans); p_load(effectsize); p_load(sjPlot)
 
-m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
+m_aov <- lm(Score ~ Hierarchy * chartjunk, data = dat_final)
 
 # Type III with sum contrasts (reporting-friendly)
 oldc <- options(contrasts = c("contr.sum","contr.poly"))
@@ -430,50 +449,89 @@ aov_tests
 effectsize::eta_squared(aov_tests, partial = TRUE)
 
 # EMMs + pairwise (Tukey)
-emm <- emmeans(m_aov, ~ hierarchy * chartjunk)
-pairs(emmeans(m_aov, ~ chartjunk | hierarchy), adjust = "tukey")
-pairs(emmeans(m_aov, ~ hierarchy | chartjunk), adjust = "tukey")
+emm <- emmeans(m_aov, ~ Hierarchy * chartjunk)
+pairs(emmeans(m_aov, ~ chartjunk | Hierarchy), adjust = "tukey")
+pairs(emmeans(m_aov, ~ Hierarchy | chartjunk), adjust = "tukey")
 
 # Plot (report-friendly)
 theme_set(sjPlot::theme_sjplot())
 sjPlot::plot_model(m_aov, type = "int",
-                   terms = c("hierarchy","chartjunk"), ci.lvl = 0.95) +
-  labs(x = "Hierarchy", y = "Estimated mean score") +
-  guides(linetype = "none", shape = "none")
+                   terms = c("Hierarchy","chartjunk"), ci.lvl = 0.95) +
+  labs(x = "Hierarchy", y = "Estimated mean Score") +
+  # Use colorblind-friendly palette
+  scale_color_brewer(palette = "RdYlBu") 
 
 # (Optional) basic assumptions
-car::leveneTest(score ~ interaction(hierarchy, chartjunk), data = dat_final)
+car::leveneTest(Score ~ interaction(Hierarchy, chartjunk), data = dat_final)
 par(mfrow = c(1,2)); plot(m_aov, which = 1); plot(m_aov, which = 2); par(mfrow = c(1,1))
 
 ```
 
 ```{r}
+library(sjPlot)
+library(ggplot2)
+
+theme_set(theme_sjplot())
+
+# Okabe–Ito contrast-safe diverging palette
+okabe_ito_div <- c(
+  "Low" = "#E69F00",   # orange
+  "Medium" = "#999999",# gray
+  "High" = "#0072B2"   # deep blue
+)
+
+p <- plot_model(m_aov, type = "int",
+                terms = c("Hierarchy", "chartjunk"),
+                ci.lvl = 0.95) +
+  labs(x = "Hierarchy", y = "Estimated mean Score") +
+  scale_color_manual(values = okabe_ito_div, aesthetics = c("colour", "fill")) +
+  theme(
+    text = element_text(size = 12),
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.line = element_line(color = "grey30"),
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA)
+  ) +
+  # Enhance line/point visibility
+  guides(color = guide_legend(override.aes = list(size = 3))) # +
+  # geom_line(size = 1.1, alpha = 0.9) +
+  # geom_point(size = 3, stroke = 0.8)
+
+p
+
+```
+
+
+```{r}
 # 1) Omnibus 2×3 ANOVA + effect sizes
 options(contrasts = c("contr.sum","contr.poly"))
-m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
+m_aov <- lm(Score ~ Hierarchy * chartjunk, data = dat_final)
 aov_tab <- car::Anova(m_aov, type = 3); aov_tab
 effectsize::eta_squared(aov_tab, partial = TRUE)
 
 # 2) Planned linear trend for chartjunk (it’s ordered)
-# overall (balanced over hierarchy) and within each hierarchy
-library(emmeans)
+# overall (balanced over Hierarchy) and within each Hierarchy
+p_load(emmeans)
 emm_cj   <- emmeans(m_aov, ~ chartjunk, weights = "equal")
 contrast(emm_cj, "poly")              # look at the Linear row
 
-emm_cj_h <- emmeans(m_aov, ~ chartjunk | hierarchy, weights = "equal")
-contrast(emm_cj_h, "poly")            # Linear per-hierarchy
+emm_cj_h <- emmeans(m_aov, ~ chartjunk | Hierarchy, weights = "equal")
+contrast(emm_cj_h, "poly")            # Linear per-Hierarchy
 
-# 3) Simple effects of chartjunk within each hierarchy (Tukey)
+# 3) Simple effects of chartjunk within each Hierarchy (Tukey)
 pairs(emm_cj_h, adjust = "tukey")
 
 # (Optional) visualize the monotone look you’re seeing
 emm_df <- as.data.frame(confint(emm_cj_h))
-ggplot(emm_df, aes(chartjunk, emmean, group = hierarchy, color = hierarchy)) +
+ggplot(emm_df, aes(chartjunk, emmean, group = Hierarchy, color = Hierarchy)) +
   geom_line(position = position_dodge(.2)) +
   geom_point(position = position_dodge(.2)) +
   geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
                 width = .12, position = position_dodge(.2)) +
-  labs(x = "Chartjunk", y = "Estimated mean score (balanced)") +
+  labs(x = "Chartjunk", y = "Estimated mean Score (balanced)") +
   theme_minimal(base_size = 12)
 
 ```
@@ -483,12 +541,12 @@ dat_final$chartjunk <- factor(dat_final$chartjunk,
                                levels = c("Low","Medium","High"),
                                ordered = TRUE)
 
-# contrasts: sum for hierarchy (Type III friendly), polynomial for chartjunk
-contrasts(dat_final$hierarchy) <- contr.sum(4)
+# contrasts: sum for Hierarchy (Type III friendly), polynomial for chartjunk
+contrasts(dat_final$Hierarchy) <- contr.sum(4)
 contrasts(dat_final$chartjunk)  <- contr.poly(3)
 
 # refit the 2×3 model
-m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
+m_aov <- lm(Score ~ Hierarchy * chartjunk, data = dat_final)
 
 # overall Type III tests
 car::Anova(m_aov, type = 3)
@@ -496,29 +554,29 @@ car::Anova(m_aov, type = 3)
 ```
 
 ```{r}
-library(emmeans)
+p_load(emmeans)
 
-# overall linear trend for chartjunk (balanced over hierarchy)
+# overall linear trend for chartjunk (balanced over Hierarchy)
 emm_cj <- emmeans(m_aov, ~ chartjunk, weights = "equal")
 contrast(emm_cj, "poly")   # check the "Linear" row
 
-# linear trend within each hierarchy
-emm_cj_h <- emmeans(m_aov, ~ chartjunk | hierarchy, weights = "equal")
-contrast(emm_cj_h, "poly") # Linear per hierarchy level
+# linear trend within each Hierarchy
+emm_cj_h <- emmeans(m_aov, ~ chartjunk | Hierarchy, weights = "equal")
+contrast(emm_cj_h, "poly") # Linear per Hierarchy level
 
 ```
 
 ```{r}
-# ---- linear contrast at a fixed hierarchy level -----------------------------
+# ---- linear contrast at a fixed Hierarchy level -----------------------------
 # deps
-library(emmeans)
-library(ggplot2)
-library(sjPlot)  # for theme_sjplot()
+p_load(emmeans)
+p_load(ggplot2)
+p_load(sjPlot)  # for theme_sjplot()
 
 plot_linear_contrast_at <- function(
   m,
   focal,                     # character: the factor you want the linear contrast on (e.g., "cond")
-  moderator = "hierarchy",   # character: the factor to hold constant
+  moderator = "Hierarchy",   # character: the factor to hold constant
   at_level = NULL,           # which level of moderator to hold fixed (e.g., "Manager")
   contrast = c("poly","custom"),  # "poly" for polynomial linear trend, or "custom"
   custom_weights = NULL,     # numeric vector if contrast = "custom" (length = #levels of focal)
@@ -537,10 +595,10 @@ plot_linear_contrast_at <- function(
     }
   }
 
-  # build a reference grid with hierarchy held constant
+  # build a reference grid with Hierarchy held constant
   rg <- ref_grid(m, at = setNames(list(at_level), moderator), type = type)
 
-  # EMMs for the focal factor at that hierarchy level
+  # EMMs for the focal factor at that Hierarchy level
   emm <- emmeans(rg, as.formula(paste0("~ ", focal)), weights = emm_weights)
 
   # Linear contrast
@@ -590,8 +648,8 @@ plot_linear_contrast_at <- function(
 
 # EXAMPLE USAGE:
 # pacman::p_load(lme4)
-# m <- lmer(y ~ cond * hierarchy + (1|id), data = d)  # or lm()/glm()
-# out <- plot_linear_contrast_at(m, focal = "cond", moderator = "hierarchy",
+# m <- lmer(y ~ cond * Hierarchy + (1|id), data = d)  # or lm()/glm()
+# out <- plot_linear_contrast_at(m, focal = "cond", moderator = "Hierarchy",
 #                                at_level = "Manager", contrast = "poly",
 #                                type = "response", emm_weights = "equal")
 # out$plot
@@ -600,7 +658,7 @@ plot_linear_contrast_at <- function(
 ```
 
 ```{r}
-# --- Linear contrasts for chartjunk while holding hierarchy constant ----
+# --- Linear contrasts for chartjunk while holding Hierarchy constant ----
 
 # pick which fitted model you want to use
 # (no covariate 2×3)     or     (ANCOVA with use_never)
@@ -611,12 +669,12 @@ mod <- m_aov              # or: mod <- m_anc
 wts <- "equal"            # or: wts <- "proportional"
 
 # Uses your existing m_aov (or m_anc), dat_final, and plot_linear_contrast_at()
-emm_cj_h <- emmeans(mod, ~ chartjunk | hierarchy, weights = wts)
+emm_cj_h <- emmeans(mod, ~ chartjunk | Hierarchy, weights = wts)
 emm_df   <- as.data.frame(confint(emm_cj_h))
 emm_df$xnum <- as.numeric(emm_df$chartjunk)
 
 ggplot(emm_df, aes(x = xnum, y = emmean)) +
-  facet_wrap(~ hierarchy) +
+  facet_wrap(~ Hierarchy) +
   geom_point(size = 2.5) +
   geom_line(group = 1) +
   geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = .12) +
@@ -639,16 +697,16 @@ dat_final$chartjunk <- factor(dat_final$chartjunk,
 
 # If needed, fit (you already have m_aov from above)
 if (!exists("m_aov")) {
-  m_aov <- lm(score ~ hierarchy * chartjunk, data = dat_final)
+  m_aov <- lm(Score ~ Hierarchy * chartjunk, data = dat_final)
 }
 
-# 1) RAW means (ignore hierarchy entirely)
+# 1) RAW means (ignore Hierarchy entirely)
 raw_df <- dat_final %>%
   group_by(chartjunk) %>%
   summarize(
-    n = sum(!is.na(score)),
-    mean = mean(score, na.rm = TRUE),
-    sd = sd(score, na.rm = TRUE),
+    n = sum(!is.na(Score)),
+    mean = mean(Score, na.rm = TRUE),
+    sd = sd(Score, na.rm = TRUE),
     se = sd / sqrt(n),
     tcrit = qt(.975, df = pmax(n - 1, 1)),
     lower = mean - tcrit * se,
@@ -660,10 +718,10 @@ p_raw <- ggplot(raw_df, aes(x = chartjunk, y = mean, group = 1)) +
   geom_line() +
   geom_point(size = 3) +
   geom_errorbar(aes(ymin = lower, ymax = upper), width = .12) +
-  labs(x = "Chartjunk", y = "Score", title = "Raw means (ignoring hierarchy)") +
+  labs(x = "Chartjunk", y = "Score", title = "Raw means (ignoring Hierarchy)") +
   theme_sjplot()
 
-# 2) ADJUSTED means (EMMs) for chartjunk, balanced over hierarchy
+# 2) ADJUSTED means (EMMs) for chartjunk, balanced over Hierarchy
 emm_cj_eq <- emmeans(m_aov, ~ chartjunk, weights = "equal")
 emm_df <- as.data.frame(confint(emm_cj_eq))
 
@@ -672,7 +730,7 @@ p_adj <- ggplot(emm_df, aes(x = chartjunk, y = emmean, group = 1)) +
   geom_point(size = 3) +
   geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = .12) +
   labs(x = "Chartjunk", y = "Estimated marginal mean",
-       title = "EMMs balanced over hierarchy") +
+       title = "EMMs balanced over Hierarchy") +
   theme_sjplot()
 
 # Show side by side
@@ -682,6 +740,176 @@ p_raw | p_adj
 # If you want the adjusted version to use sample-mix instead of equal weighting:
 # emm_cj_prop <- emmeans(m_aov, ~ chartjunk, weights = "proportional")
 # as.data.frame(confint(emm_cj_prop))
+
+```
+```{r}
+## Recoding dat$Hierarchy
+dat$Hierarchy <- as.character(dat$Hierarchy)
+dat$Hierarchy[dat$Hierarchy == "NoHierarchy"] <- "None"
+dat$Hierarchy[dat$Hierarchy == "FloorplanHierarchy"] <- "Floorplan"
+dat$Hierarchy[dat$Hierarchy == "RoomHierarchy"] <- "Room"
+dat$Hierarchy[dat$Hierarchy == "ImportanceHierarchy"] <- "Importance"
+```
+
+# 11) sjPlot of ANOVA
+
+```{r}
+library(sjPlot)
+library(ggplot2)
+
+p <- sjPlot::plot_model(
+  m_aov,
+  type  = "eff",
+  terms = c("chartjunk", "Hierarchy"),
+  ci.lvl = 0.95
+) +
+  labs(x = "Chartjunk", y = "Estimated mean Score") + ylim(c(2.4,4.0))
+
+# Add lines between levels for each Hierarchy group
+p + geom_line() -> q
+
+# Save as 1080p PNG with white background
+ggsave(
+  filename = "chartjunk_hierarchy_1080p.png",
+  plot     = q,
+  width    = 1920,
+  height   = 1080,
+  units    = "px",
+  bg       = "white"
+)
+
+```
+
+```{r}
+library(sjPlot)
+library(ggplot2)
+
+p <- sjPlot::plot_model(
+  m_aov,
+  type  = "eff",
+  terms = c("chartjunk", "Hierarchy"),
+  ci.lvl = 0.95
+) +
+  labs(x = "Chartjunk", y = "Estimated mean score") +
+  ylim(c(2.4, 4.0))
+
+q <- p +
+  geom_line() +
+  facet_wrap(~group, nrow = 1) +     # one facet per Hierarchy level, single row
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "none",         # legend is redundant once faceted
+    panel.spacing.x  = unit(0.8, "lines")  # ← increase gap between panels
+    )
+
+q
+
+
+# Save as 1080p PNG with white background
+ggsave(
+  filename = "chartjunk_hierarchy_faceted_1080p.png",
+  plot     = q,
+  width    = 1920,
+  height   = 1080,
+  units    = "px",
+  bg       = "white"
+)
+```
+
+
+```{r}
+p <- sjPlot::plot_model(
+  m_aov,
+  type  = "eff",
+  terms = c("chartjunk"),
+  ci.lvl = 0.95
+) +
+  labs(x = "Hierarchy", y = "Estimated mean Score") + ylim(c(2.4,4))
+
+# Add lines between levels for each Hierarchy group
+p + geom_line()
+```
+
+```{r}
+
+
+
+p <- sjPlot::plot_model(
+  m_aov,
+  type  = "eff",
+  terms = c("Hierarchy"),
+  ci.lvl = 0.95
+) +
+  labs(x = "Hierarchy", y = "Estimated mean Score") +
+  ylim(c(2.4, 4)) 
+
+p
+```
+
+```{r}
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+pacman::p_load(
+  sjPlot,
+  ggplot2,
+  ggh4x,
+  scales
+)
+
+hierarchy_cols <- c(
+  Importance = "#E41A1C",
+  None       = "#377EB8",
+  Room       = "#4DAF4A",
+  Floorplan  = "#984EA3"
+)
+
+p <- sjPlot::plot_model(
+  m_aov,
+  type  = "eff",
+  terms = c("chartjunk", "Hierarchy"),
+  ci.lvl = 0.95
+) +
+  labs(x = "Chartjunk", y = "Estimated mean score") +
+  ylim(c(2.4, 4.0)) +
+  scale_colour_manual(values = hierarchy_cols) +
+  theme_bw(base_size = 12)
+
+q <- p +
+  geom_line() +
+  ggh4x::facet_wrap2(
+    ~group,
+    nrow = 1,
+    strip = ggh4x::strip_themed(
+      background_x = ggh4x::elem_list_rect(
+        fill   = alpha(hierarchy_cols, 0.18),
+        colour = "grey40"
+      ),
+      text_x = ggh4x::elem_list_text(colour = "black")
+    )
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position  = "none",
+    strip.background = element_blank(),
+        panel.spacing.x  = unit(0.8, "lines")  # ← increase gap between panels
+  )
+
+q
+
+```
+
+```{r}
+ggsave(
+  filename = "chartjunk_hierarchy_facets_1080p.png",
+  plot     = q,
+  width    = 1920,
+  height   = 1080,
+  units    = "px",
+  bg       = "white"
+)
 
 ```
 
