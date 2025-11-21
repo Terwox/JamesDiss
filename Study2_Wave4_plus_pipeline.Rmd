@@ -1,9 +1,10 @@
 ---
 title: "Study 2 — Wave4+ Clean Pipeline (Attention + Hardcoded Longstring)"
 output:
-  pdf_document: default
   html_document:
     df_print: paged
+    code_folding: hide
+  pdf_document: default
 editor_options:
   chunk_output_type: inline
 ---
@@ -25,7 +26,7 @@ options(cli.num_colors = 1, crayon.enabled = FALSE)
 
 ```{r config}
 # ---- PATH ----
-path <- r"(D:\Dropbox\USD\Dissertation\Collab folder\Data\Dissertation+-+Study+2+-+Wave4+_October+6,+2025_15.23.csv)"
+path <- r"(Dissertation+-+Study+2+-+Wave4+_October+6,+2025_15.23.csv)"
 ```
 
 # 1) Packages
@@ -268,6 +269,7 @@ ggplot(dat_final, aes(chartjunk, score)) +
   geom_boxplot(width = .12, outlier.shape = NA) +
   geom_jitter(width = .12, height = 0, alpha = .25, size = 1) +
   labs(x = "Chartjunk", y = "Score") +
+  ylim (c(1,7))+
   theme_minimal(base_size = 12)
 ```
 
@@ -353,6 +355,8 @@ par(mfrow = c(1,1))
 ```
 
 ```{r}
+library(pacman)
+p_load(ggthemes)
 # ---- sjPlot visuals (ANCOVA) ----
 pacman::p_load(sjPlot, sjlabelled)
 
@@ -367,7 +371,7 @@ p_int <- sjPlot::plot_model(
   terms = c("hierarchy", "chartjunk"),   # x, group
   ci.lvl = 0.95
 ) + labs(x = "Hierarchy", y = "Adjusted mean score") +
-    guides(linetype = "none", shape = "none")
+    guides(linetype = "none", shape = "none") # + theme_tufte()
 p_int
 
 # 2) Predicted means, explicitly showing both use_never levels
@@ -377,7 +381,7 @@ p_pred <- sjPlot::plot_model(
   type  = "pred",
   terms = c("hierarchy", "chartjunk", "use_never")
 ) + labs(x = "Hierarchy", y = "Adjusted mean score", color = "Chartjunk") +
-    guides(linetype = "none", shape = "none")
+    guides(linetype = "none", shape = "none") 
 p_pred
 
 # 3) Coefficient forest (fixed effects with 95% CI)
@@ -398,9 +402,22 @@ sjPlot::tab_model(
   p.style = "stars",
   string.pred = "Predictor",
   string.est  = "b"
-)
+) + theme_tufte()
 
 ```
+
+```{r}
+# 1) Interaction: hierarchy × chartjunk (averages over use_never by sample mix)
+p_hierarchy <- sjPlot::plot_model(
+  m_anc,
+  type  = "eff",
+  terms = c("hierarchy"),   # x, group
+  ci.lvl = 0.95
+) + labs(x = "Hierarchy", y = "Adjusted mean score") +
+    guides(linetype = "none", shape = "none") # + theme_tufte()
+p_hierarchy
+```
+
 
 ```{r}
 m_mod <- lm(score ~ hierarchy * chartjunk * use_never, data = dat_final)
@@ -683,5 +700,31 @@ p_raw | p_adj
 # emm_cj_prop <- emmeans(m_aov, ~ chartjunk, weights = "proportional")
 # as.data.frame(confint(emm_cj_prop))
 
+```
+
+```{r}
+str(dat_attn)
+```
+
+```{r}
+library(dplyr)
+
+dat_sum <- dat_attn |>
+  group_by(chartjunk, hierarchy) |>
+  summarise(
+    mean_score = mean(score, na.rm = TRUE),
+    sd_score   = sd(score,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+dat_sum
+```
+```{r}
+agg <- aggregate(score ~ chartjunk + hierarchy, dat_attn,
+                 \(x) c(mean = mean(x), sd = sd(x)))
+
+agg$score <- round(agg$score, 1)
+
+agg
 ```
 
