@@ -425,20 +425,20 @@ sjPlot::tab_model(
 ```
 
 ```{r}
-# 1) Interaction: hierarchy × chartjunk (averages over use_never by sample mix)
-p_hierarchy <- sjPlot::plot_model(
+# 1) Interaction: Hierarchy × chartjunk (averages over use_never by sample mix)
+p_Hierarchy <- sjPlot::plot_model(
   m_anc,
   type  = "eff",
-  terms = c("hierarchy"),   # x, group
+  terms = c("Hierarchy"),   # x, group
   ci.lvl = 0.95
-) + labs(x = "Hierarchy", y = "Adjusted mean score") +
+) + labs(x = "Hierarchy", y = "Adjusted mean Score") +
     guides(linetype = "none", shape = "none") # + theme_tufte()
-p_hierarchy
+p_Hierarchy
 ```
 
 
 ```{r}
-m_mod <- lm(score ~ hierarchy * chartjunk * use_never, data = dat_final)
+m_mod <- lm(Score ~ Hierarchy * chartjunk * use_never, data = dat_final)
 car::Anova(m_mod, type = 3)
 
 ```
@@ -786,7 +786,7 @@ p + geom_line() -> q
 
 # Save as 1080p PNG with white background
 ggsave(
-  filename = "chartjunk_hierarchy_1080p.png",
+  filename = "chartjunk_Hierarchy_1080p.png",
   plot     = q,
   width    = 1920,
   height   = 1080,
@@ -806,7 +806,7 @@ p <- sjPlot::plot_model(
   terms = c("chartjunk", "Hierarchy"),
   ci.lvl = 0.95
 ) +
-  labs(x = "Chartjunk", y = "Estimated mean score") +
+  labs(x = "Chartjunk", y = "Estimated mean Score") +
   ylim(c(2.4, 4.0))
 
 q <- p +
@@ -824,7 +824,7 @@ q
 
 # Save as 1080p PNG with white background
 ggsave(
-  filename = "chartjunk_hierarchy_faceted_1080p.png",
+  filename = "chartjunk_Hierarchy_faceted_1080p.png",
   plot     = q,
   width    = 1920,
   height   = 1080,
@@ -875,7 +875,7 @@ pacman::p_load(
   scales
 )
 
-hierarchy_cols <- c(
+Hierarchy_cols <- c(
   Importance = "#E41A1C",
   None       = "#377EB8",
   Room       = "#4DAF4A",
@@ -888,9 +888,9 @@ p <- sjPlot::plot_model(
   terms = c("chartjunk", "Hierarchy"),
   ci.lvl = 0.95
 ) +
-  labs(x = "Chartjunk", y = "Estimated mean score") +
+  labs(x = "Chartjunk", y = "Estimated mean Score") +
   ylim(c(2.4, 4.0)) +
-  scale_colour_manual(values = hierarchy_cols) +
+  scale_colour_manual(values = Hierarchy_cols) +
   theme_bw(base_size = 12)
 
 q <- p +
@@ -900,7 +900,7 @@ q <- p +
     nrow = 1,
     strip = ggh4x::strip_themed(
       background_x = ggh4x::elem_list_rect(
-        fill   = alpha(hierarchy_cols, 0.18),
+        fill   = alpha(Hierarchy_cols, 0.18),
         colour = "grey40"
       ),
       text_x = ggh4x::elem_list_text(colour = "black")
@@ -919,7 +919,7 @@ q
 
 ```{r}
 ggsave(
-  filename = "chartjunk_hierarchy_facets_1080p.png",
+  filename = "chartjunk_Hierarchy_facets_1080p.png",
   plot     = q,
   width    = 1920,
   height   = 1080,
@@ -927,202 +927,5 @@ ggsave(
   bg       = "white"
 )
 
-```
-
-```{r}
-## Recoding dat$Hierarchy
-dat$Hierarchy <- as.character(dat$Hierarchy)
-dat$Hierarchy[dat$Hierarchy == "NoHierarchy"] <- "None"
-dat$Hierarchy[dat$Hierarchy == "FloorplanHierarchy"] <- "Floorplan"
-dat$Hierarchy[dat$Hierarchy == "RoomHierarchy"] <- "Room"
-dat$Hierarchy[dat$Hierarchy == "ImportanceHierarchy"] <- "Importance"
-```
-
-# 11) sjPlot of ANOVA
-
-```{r}
-library(sjPlot)
-library(ggplot2)
-
-p <- sjPlot::plot_model(
-  m_aov,
-  type  = "eff",
-  terms = c("chartjunk", "Hierarchy"),
-  ci.lvl = 0.95
-) +
-  labs(x = "Chartjunk", y = "Estimated mean Score") + ylim(c(2.4,4.0))
-
-# Add lines between levels for each Hierarchy group
-p + geom_line() -> q
-
-# Save as 1080p PNG with white background
-ggsave(
-  filename = "chartjunk_hierarchy_1080p.png",
-  plot     = q,
-  width    = 1920,
-  height   = 1080,
-  units    = "px",
-  bg       = "white"
-)
-
-```
-
-```{r}
-library(sjPlot)
-library(ggplot2)
-
-p <- sjPlot::plot_model(
-  m_aov,
-  type  = "eff",
-  terms = c("chartjunk", "Hierarchy"),
-  ci.lvl = 0.95
-) +
-  labs(x = "Chartjunk", y = "Estimated mean score") +
-  ylim(c(2.4, 4.0))
-
-q <- p +
-  geom_line() +
-  facet_wrap(~group, nrow = 1) +     # one facet per Hierarchy level, single row
-  theme_bw(base_size = 12) +
-  theme(
-    panel.grid.minor = element_blank(),
-    legend.position = "none",         # legend is redundant once faceted
-    panel.spacing.x  = unit(0.8, "lines")  # ← increase gap between panels
-    )
-
-q
-
-
-# Save as 1080p PNG with white background
-ggsave(
-  filename = "chartjunk_hierarchy_faceted_1080p.png",
-  plot     = q,
-  width    = 1920,
-  height   = 1080,
-  units    = "px",
-  bg       = "white"
-)
-```
-
-
-```{r}
-p <- sjPlot::plot_model(
-  m_aov,
-  type  = "eff",
-  terms = c("chartjunk"),
-  ci.lvl = 0.95
-) +
-  labs(x = "Hierarchy", y = "Estimated mean Score") + ylim(c(2.4,4))
-
-# Add lines between levels for each Hierarchy group
-p + geom_line()
-```
-
-```{r}
-
-
-
-p <- sjPlot::plot_model(
-  m_aov,
-  type  = "eff",
-  terms = c("Hierarchy"),
-  ci.lvl = 0.95
-) +
-  labs(x = "Hierarchy", y = "Estimated mean Score") +
-  ylim(c(2.4, 4)) 
-
-p
-```
-
-```{r}
-if (!requireNamespace("pacman", quietly = TRUE)) {
-  install.packages("pacman")
-}
-
-pacman::p_load(
-  sjPlot,
-  ggplot2,
-  ggh4x,
-  scales
-)
-
-hierarchy_cols <- c(
-  Importance = "#E41A1C",
-  None       = "#377EB8",
-  Room       = "#4DAF4A",
-  Floorplan  = "#984EA3"
-)
-
-p <- sjPlot::plot_model(
-  m_aov,
-  type  = "eff",
-  terms = c("chartjunk", "Hierarchy"),
-  ci.lvl = 0.95
-) +
-  labs(x = "Chartjunk", y = "Estimated mean score") +
-  ylim(c(2.4, 4.0)) +
-  scale_colour_manual(values = hierarchy_cols) +
-  theme_bw(base_size = 12)
-
-q <- p +
-  geom_line() +
-  ggh4x::facet_wrap2(
-    ~group,
-    nrow = 1,
-    strip = ggh4x::strip_themed(
-      background_x = ggh4x::elem_list_rect(
-        fill   = alpha(hierarchy_cols, 0.18),
-        colour = "grey40"
-      ),
-      text_x = ggh4x::elem_list_text(colour = "black")
-    )
-  ) +
-  theme(
-    panel.grid.minor = element_blank(),
-    legend.position  = "none",
-    strip.background = element_blank(),
-        panel.spacing.x  = unit(0.8, "lines")  # ← increase gap between panels
-  )
-
-q
-
-```
-
-```{r}
-ggsave(
-  filename = "chartjunk_hierarchy_facets_1080p.png",
-  plot     = q,
-  width    = 1920,
-  height   = 1080,
-  units    = "px",
-  bg       = "white"
-)
-
-```
-
-```{r}
-str(dat_attn)
-```
-
-```{r}
-library(dplyr)
-
-dat_sum <- dat_attn |>
-  group_by(chartjunk, hierarchy) |>
-  summarise(
-    mean_score = mean(score, na.rm = TRUE),
-    sd_score   = sd(score,   na.rm = TRUE),
-    .groups = "drop"
-  )
-
-dat_sum
-```
-```{r}
-agg <- aggregate(score ~ chartjunk + hierarchy, dat_attn,
-                 \(x) c(mean = mean(x), sd = sd(x)))
-
-agg$score <- round(agg$score, 1)
-
-agg
 ```
 
