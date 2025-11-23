@@ -18,7 +18,7 @@ library(pacman)
 ```{r}
 p_load(readr)
 # Load the data
-df <- read_csv("D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation - Pilot_May 1, 2025_16.58.csv")
+df <- read_csv("Dissertation - Pilot_May 1, 2025_16.58.csv")
 
 # Load the data (no need to skip rows — metadata already removed)
 # df <- read.csv("Dissertation - Pilot_May 1, 2025_16.58.csv")
@@ -101,7 +101,7 @@ ggplot(df, aes(x = group, y = Total_Score)) +
 ```{r}
 p_load(readr)
 # Load the data
-df <- read_csv("D:/Dropbox/USD/Dissertation/Collab folder/Data/Dissertation+-+Pilot_August+26,+2025_15.07.csv")
+df <- read_csv("Dissertation+-+Pilot_August+26,+2025_15.07.csv")
 ```
 
 ## Score data
@@ -452,26 +452,26 @@ model <- lm(Total_Score ~ group, data = df_final)
 # Get summary object
 model_summary <- summary(model)
 
-# Extract estimate and standard error for groupImprovedBoth
-coef_table <- model_summary$coefficients
-estimate_both <- coef_table["groupImprovedBoth", "Estimate"]
-
-# Get residual standard error (pooled SD)
-pooled_sd <- model_summary$sigma
-
-# Compute Cohen's d for the contrast (ImprovedBoth vs. reference group)
-cohens_d <- estimate_both / pooled_sd
-
-# Show the result
-print(paste("Cohen's d:", round(cohens_d, 3)))
-
-
-# Compute required sample size for 80% power, two-tailed test
-pwr.t.test(d = cohens_d,
-           power = 0.80,
-           sig.level = 0.05,
-           type = "two.sample",
-           alternative = "two.sided")
+# # Extract estimate and standard error for groupImprovedBoth
+# coef_table <- model_summary$coefficients
+# estimate_both <- coef_table["groupImprovedBoth", "Estimate"]
+# 
+# # Get residual standard error (pooled SD)
+# pooled_sd <- model_summary$sigma
+# 
+# # Compute Cohen's d for the contrast (ImprovedBoth vs. reference group)
+# cohens_d <- estimate_both / pooled_sd
+# 
+# # Show the result
+# print(paste("Cohen's d:", round(cohens_d, 3)))
+# 
+# 
+# # Compute required sample size for 80% power, two-tailed test
+# pwr.t.test(d = cohens_d,
+#            power = 0.80,
+#            sig.level = 0.05,
+#            type = "two.sample",
+#            alternative = "two.sided")
 
 ```
 # 2x2 groups
