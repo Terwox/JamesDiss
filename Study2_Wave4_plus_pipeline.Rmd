@@ -9,12 +9,16 @@ editor_options:
   chunk_output_type: inline
 ---
 
+# 0) Config
+
+## This sets up options for knitting the document into a PDF or HTML.
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(message = TRUE, warning = TRUE)
 options(cli.num_colors = 1, crayon.enabled = FALSE)
 ```
 
-# 0) Config
+## File path (localized into the git branch)
 
 - **Edit the `path`** below to your CSV export.
 - Column names are **hard-coded** to your Wave4+ survey. If your export uses different labels, adjust in the **Column Map** section.
@@ -37,7 +41,7 @@ library(pacman)
 pacman::p_load(readr, dplyr, stringr, ggplot2, broom, effectsize, careless)
 ```
 
-# 2) Load
+# 2) Load (Extract from CSV)
 
 ```{r load}
 raw0 <- readr::read_csv(
@@ -103,7 +107,8 @@ dat$Hierarchy <- factor(dat$Hierarchy,
 
 # 4) Column Map (hard-coded)
 
-These are the exact headers expected in your Wave4+ export. Adjust here if your CSV labels differ.
+These are the exact headers expected in the Wave4+ export. 
+For copying users, adjust here if your CSV labels differ.
 
 ```{r colmap}
 # === Column Map (Wave4+ CSV using QIDs) ===
@@ -147,6 +152,8 @@ if (!all(req_cols %in% names(dat))) {
 ```
 
 # 5) Attention filter (Q20 must contain "smart home")
+
+## Step one of careless responding removal -- a standard manipulation check.
 
 ```{r attention}
 keep_idx <- grepl("smart[[:space:]]*home", dat[[COL_Q20]], ignore.case = TRUE)
@@ -232,6 +239,11 @@ dat_attn$SeventhItem <- SeventhItem
 # 7) Longstring via `{careless}`
 
 We compute longest run across the seven 1–4 codes. To avoid NA runs, we replace missing entries with **unique per-column sentinels** so consecutive NAs never match.
+
+## Step two of careless responding
+  1) Determine the longstring value
+  2) Compute Tukey's Fence
+  3) Remove rows where longstring > fence
 
 ```{r longstring}
 ls_mat <- dat_attn[, c("FirstItem","SecondItem","ThirdItem","FourthItem","FifthItem","SixthItem","SeventhItem")]
@@ -927,5 +939,31 @@ ggsave(
   bg       = "white"
 )
 
+```
+
+# 12) Effect sizes from ANOVA
+
+```{r}
+# assuming anova_model is your 2x2 ANOVA (aov/lm or afex object)
+p_load(effectsize)
+
+round_df <- function(x, k = 3) {
+  x <- as.data.frame(x)
+  num <- vapply(x, is.numeric, logical(1))
+  x[num] <- lapply(x[num], round, k)
+  x
+}
+
+es_omega  <- omega_squared(m_aov)
+es_eta_p  <- eta_squared(m_aov, partial = TRUE)
+es_eta_g  <- eta_squared(m_aov, generalized = TRUE)
+
+round_df(es_omega)
+round_df(es_eta_p)
+round_df(es_eta_g)
+```
+
+```{r}
+summary(m_aov)
 ```
 
