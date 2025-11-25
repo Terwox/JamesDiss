@@ -509,9 +509,7 @@ print(summary.lm(anova_model), digits = 3)
 
 ```{r}
 # assuming anova_model is your 2x2 ANOVA (aov/lm or afex object)
-library(effectsize)
-
-library(effectsize)
+p_load(effectsize)
 
 round_df <- function(x, k = 3) {
   x <- as.data.frame(x)
