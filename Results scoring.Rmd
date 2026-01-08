@@ -538,6 +538,13 @@ means
 
 ```
 
+```{r}
+# Add SD alongside means
+stats <- aggregate(Total_Score ~ hierarchy + chartjunk, data = df_valid, 
+                   FUN = function(x) c(mean = round(mean(x), 2), sd = round(sd(x), 2)))
+stats <- do.call(data.frame, stats)
+stats
+```
 
 ```{r}
 # Use lm instead of aov for compatibility with sjPlot
