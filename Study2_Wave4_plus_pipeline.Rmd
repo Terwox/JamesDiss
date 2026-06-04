@@ -818,7 +818,11 @@ p <- sjPlot::plot_model(
   terms = c("chartjunk", "Hierarchy"),
   ci.lvl = 0.95
 ) +
-  labs(x = "Chartjunk", y = "Estimated mean Score") +
+  labs(
+    x = "Chartjunk",
+    y = "Estimated mean Score",
+    title = "Mean values of Score"
+  ) +
   ylim(c(2.4, 4.0))
 
 q <- p +
