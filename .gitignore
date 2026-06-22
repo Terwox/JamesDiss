@@ -4,3 +4,6 @@
 .Ruserdata
 chartjunk_hierarchy_1080p.png
 chartjunk_hierarchy_faceted_1080p.png
+
+# OMX local runtime artifacts
+.omx/
