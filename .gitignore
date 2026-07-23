@@ -5,8 +5,6 @@
 chartjunk_hierarchy_1080p.png
 chartjunk_hierarchy_faceted_1080p.png
 
-# OMX local runtime artifacts
-.omx/
 
 # Session and generated artifacts
 __pycache__/
@@ -14,3 +12,6 @@ __pycache__/
 *.pyo
 nul
 .ipynb_checkpoints/
+
+# OMX local runtime artifacts
+.omx/
